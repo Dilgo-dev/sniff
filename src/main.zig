@@ -9,6 +9,7 @@ const glym = @import("glym");
 const packet = @import("packet.zig");
 const capture = @import("capture.zig");
 const filter_mod = @import("filter.zig");
+const pcap = @import("pcap.zig");
 
 const Style = glym.style.Style;
 const Rgb = glym.style.Rgb;
@@ -24,6 +25,10 @@ fn captureOne(_: std.mem.Allocator) anyerror!?App {
     if (frame.len < 14) return null;
     var info = packet.parse(frame) orelse return null;
     info.timestamp_ms = std.time.milliTimestamp();
+    // Store raw bytes snapshot for pcap export
+    const snap = @min(frame.len, packet.snap_len);
+    @memcpy(info.raw[0..snap], frame[0..snap]);
+    info.raw_len = @intCast(snap);
     return .{ .captured = info };
 }
 
@@ -35,7 +40,7 @@ const App = union(enum) {
 
 const P = glym.Program(Model, App);
 
-const InputMode = enum { none, filter, search };
+const InputMode = enum { none, filter, search, export };
 
 const Model = struct {
     packets: std.ArrayList(packet.PacketInfo) = .{},
@@ -61,6 +66,10 @@ const Model = struct {
     input_len: u8 = 0,
     input_cursor: u8 = 0,
     input_error: bool = false,
+    // Export status message (shown briefly in title bar)
+    status_buf: [64]u8 = .{0} ** 64,
+    status_len: u8 = 0,
+    status_time: i64 = 0,
 };
 
 const max_packets = 50000;
@@ -158,6 +167,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
             if (c == 'f') openInput(model, .filter);
             if (c == '/') openInput(model, .search);
+            if (c == 'w') openInput(model, .export);
             if (c == 'n') searchNext(model, true);
             if (c == 'N') searchNext(model, false);
             if (c == 'F') model.follow = !model.follow;
@@ -202,7 +212,6 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
 fn openInput(model: *Model, mode: InputMode) void {
     model.input_mode = mode;
     model.input_error = false;
-    // Pre-fill with current value
     switch (mode) {
         .filter => {
             @memcpy(model.input_buf[0..model.filter_len], model.filter_buf[0..model.filter_len]);
@@ -211,6 +220,11 @@ fn openInput(model: *Model, mode: InputMode) void {
         .search => {
             @memcpy(model.input_buf[0..model.search_len], model.search_buf[0..model.search_len]);
             model.input_len = model.search_len;
+        },
+        .export => {
+            const default = "capture.pcap";
+            @memcpy(model.input_buf[0..default.len], default);
+            model.input_len = default.len;
         },
         .none => {},
     }
@@ -229,6 +243,7 @@ fn handleTextInput(model: *Model, k: glym.input.Key) void {
             switch (mode) {
                 .filter => applyFilter(model),
                 .search => applySearch(model),
+                .export => applyExport(model),
                 .none => {},
             }
         },
@@ -280,6 +295,42 @@ fn applyFilter(model: *Model) void {
     }
     model.selected = 0;
     model.scroll = 0;
+}
+
+fn applyExport(model: *Model) void {
+    const path = model.input_buf[0..model.input_len];
+    if (path.len == 0) return;
+
+    const filter_fn: ?*const fn (*const packet.PacketInfo) bool = if (model.filter.active)
+        struct {
+            // Wrapper that captures the filter via the global model pointer
+            fn matches(pkt: *const packet.PacketInfo) bool {
+                return export_filter.matches(pkt);
+            }
+        }.matches
+    else
+        null;
+
+    // Snapshot the active filter for the export callback
+    export_filter = model.filter;
+
+    const count = pcap.exportPackets(path, model.packets.items, filter_fn) catch {
+        setStatus(model, "Export failed!");
+        return;
+    };
+
+    var sbuf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&sbuf, "Exported {d} packets to {s}", .{ count, path }) catch "Exported";
+    setStatus(model, msg);
+}
+
+var export_filter: filter_mod.Filter = .{};
+
+fn setStatus(model: *Model, msg: []const u8) void {
+    const len = @min(msg.len, model.status_buf.len);
+    @memcpy(model.status_buf[0..len], msg[0..len]);
+    model.status_len = @intCast(len);
+    model.status_time = std.time.milliTimestamp();
 }
 
 fn applySearch(model: *Model) void {
@@ -435,7 +486,14 @@ fn view(model: *Model, r: *P.Renderer) void {
         const s = std.fmt.bufPrint(&buf, " [{s}] {d} packets", .{ iface, model.packets.items.len }) catch "";
         r.writeStyledText(0, 7, s, title_style);
     }
-    if (model.paused) {
+    // Status message (export result, etc.) - shown for 3 seconds
+    const now = std.time.milliTimestamp();
+    if (model.status_len > 0 and now - model.status_time < 3000) {
+        const smsg = model.status_buf[0..model.status_len];
+        r.writeStyledText(0, cols -| @as(u16, @intCast(smsg.len + 2)), " ", .{ .bg = .{ .rgb = surface0 } });
+        r.writeStyledText(0, cols -| @as(u16, @intCast(smsg.len + 1)), smsg, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
+        r.writeStyledText(0, cols -| 1, " ", .{ .bg = .{ .rgb = surface0 } });
+    } else if (model.paused) {
         r.writeStyledText(0, cols -| 10, " PAUSED ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true });
     } else if (model.follow) {
         r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
@@ -556,13 +614,19 @@ fn view(model: *Model, r: *P.Renderer) void {
     const help_row: u16 = rows - 1;
     r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
     if (model.input_mode != .none) {
-        const prompt: []const u8 = if (model.input_mode == .filter) "filter: " else "search: ";
+        const prompt: []const u8 = switch (model.input_mode) {
+            .filter => "filter: ",
+            .search => "search: ",
+            .export => "export: ",
+            .none => "",
+        };
         const prompt_style: Style = if (model.input_error)
             .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true }
-        else if (model.input_mode == .search)
-            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true }
-        else
-            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true };
+        else switch (model.input_mode) {
+            .search => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true },
+            .export => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true },
+            else => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true },
+        };
         r.writeStyledText(help_row, 1, prompt, prompt_style);
         const plen: u16 = @intCast(prompt.len);
         const text = model.input_buf[0..model.input_len];
@@ -579,6 +643,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "f", "filter");
         col = writeHelpKey(r, help_row, col, "/", "search");
         col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
+        col = writeHelpKey(r, help_row, col, "w", "export");
         col = writeHelpKey(r, help_row, col, "F", "follow");
         _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
     }

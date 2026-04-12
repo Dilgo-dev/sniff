@@ -26,6 +26,8 @@ pub const Protocol = enum(u8) {
     }
 };
 
+pub const snap_len = 256;
+
 pub const PacketInfo = struct {
     timestamp_ms: i64 = 0,
     src_addr: [46]u8 = .{0} ** 46,
@@ -38,6 +40,8 @@ pub const PacketInfo = struct {
     length: u32 = 0,
     ip_ttl: u8 = 0,
     tcp_flags: u8 = 0,
+    raw: [snap_len]u8 = .{0} ** snap_len,
+    raw_len: u16 = 0,
 
     /// Source address as a readable string slice.
     pub fn srcAddr(self: *const PacketInfo) []const u8 {
