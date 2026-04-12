@@ -308,11 +308,15 @@ const bpf = if (builtin.os.tag == .macos) struct {
         return count;
     }
 
-    /// Pick the first non-loopback, up interface as default.
+    var default_iface_buf: IfName = .{};
+
     fn defaultIface() []const u8 {
         var buf: [1]IfName = undefined;
         const n = listIfaces(&buf);
-        if (n > 0) return buf[0].slice();
+        if (n > 0) {
+            default_iface_buf = buf[0];
+            return default_iface_buf.buf[0..default_iface_buf.len];
+        }
         return "en0";
     }
 } else struct {};
