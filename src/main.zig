@@ -749,26 +749,34 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         drawHLine(r, row, cols);
         row += 1;
 
+        // Column positions adapt to terminal width
+        const addr_col: u16 = 1;
+        const addr_w: u16 = if (cols >= 120) 42 else 20;
+        const bytes_col: u16 = addr_col + addr_w;
+        const pct_col: u16 = bytes_col + 14;
+        const bar_col: u16 = pct_col + 6;
+
         for (&top_ips) |*entry| {
             if (entry.bytes == 0) break;
             if (row >= rows -| 2) break;
 
             const addr = entry.addr[0..entry.len];
-            r.writeStyledText(row, 1, addr, .{ .fg = .{ .rgb = c_blue }, .bold = true });
+            const show_len = @min(addr.len, @as(usize, addr_w) -| 2);
+            r.writeStyledText(row, addr_col, addr[0..show_len], .{ .fg = .{ .rgb = c_blue }, .bold = true });
 
             var bbuf2: [16]u8 = undefined;
             const bs2 = fmtBytes(entry.bytes, &bbuf2);
-            r.writeStyledText(row, 20, bs2, .{ .fg = .{ .rgb = text_col } });
+            r.writeStyledText(row, bytes_col, bs2, .{ .fg = .{ .rgb = text_col } });
 
             const pct = if (total_bytes > 0) entry.bytes * 100 / total_bytes else 0;
             var pbuf: [8]u8 = undefined;
             const ps = std.fmt.bufPrint(&pbuf, "{d}%", .{pct}) catch "";
-            r.writeStyledText(row, 32, ps, .{ .fg = .{ .rgb = subtext0 } });
+            r.writeStyledText(row, pct_col, ps, .{ .fg = .{ .rgb = subtext0 } });
 
             const ratio: u16 = if (total_bytes > 0) @intCast(@min(@as(u64, bar_max), entry.bytes * bar_max / total_bytes)) else 0;
             var bc: u16 = 0;
             while (bc < ratio) : (bc += 1) {
-                r.applyCell(row, 38 + bc, 0x2588, .{ .fg = .{ .rgb = c_blue } });
+                r.applyCell(row, bar_col + bc, 0x2588, .{ .fg = .{ .rgb = c_blue } });
             }
 
             row += 1;
