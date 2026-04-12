@@ -26,7 +26,7 @@ pub const Protocol = enum(u8) {
     }
 };
 
-pub const snap_len = 256;
+pub const snap_len = 1500;
 
 pub const PacketInfo = struct {
     timestamp_ms: i64 = 0,
