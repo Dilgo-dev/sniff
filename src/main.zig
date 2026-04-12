@@ -57,6 +57,14 @@ const Model = struct {
     hex_view: bool = false,
     hex_scroll: usize = 0,
     stats_view: bool = false,
+    stream_view: bool = false,
+    stream_scroll: usize = 0,
+    stream_src: [46]u8 = .{0} ** 46,
+    stream_src_len: u8 = 0,
+    stream_dst: [46]u8 = .{0} ** 46,
+    stream_dst_len: u8 = 0,
+    stream_sport: u16 = 0,
+    stream_dport: u16 = 0,
     input_mode: InputMode = .none,
     input_buf: [128]u8 = .{0} ** 128,
     input_len: u8 = 0,
@@ -160,19 +168,40 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 's') {
                 model.stats_view = !model.stats_view;
                 model.hex_view = false;
+                model.stream_view = false;
             }
             if (c == 'x') {
                 model.hex_view = !model.hex_view;
                 model.hex_scroll = 0;
                 model.stats_view = false;
+                model.stream_view = false;
+            }
+            if (c == 't') {
+                if (model.stream_view) {
+                    model.stream_view = false;
+                } else if (getVisible(model, model.selected)) |pkt| {
+                    if (pkt.protocol == .tcp) {
+                        model.stream_view = true;
+                        model.hex_view = false;
+                        model.stats_view = false;
+                        model.stream_scroll = 0;
+                        model.stream_src = pkt.src_addr;
+                        model.stream_src_len = pkt.src_addr_len;
+                        model.stream_dst = pkt.dst_addr;
+                        model.stream_dst_len = pkt.dst_addr_len;
+                        model.stream_sport = pkt.src_port;
+                        model.stream_dport = pkt.dst_port;
+                    }
+                }
             }
             if (c == 'n') searchNext(model, true);
             if (c == 'N') searchNext(model, false);
             if (c == 'F') model.follow = !model.follow;
         },
         .arrow_up => {
-            if (model.hex_view) {
-                if (model.hex_scroll > 0) model.hex_scroll -= 1;
+            if (model.hex_view or model.stream_view) {
+                if (model.hex_view and model.hex_scroll > 0) model.hex_scroll -= 1;
+                if (model.stream_view and model.stream_scroll > 0) model.stream_scroll -= 1;
             } else {
                 model.follow = false;
                 if (model.selected > 0) model.selected -= 1;
@@ -180,8 +209,9 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
         },
         .arrow_down => {
-            if (model.hex_view) {
-                model.hex_scroll += 1;
+            if (model.hex_view or model.stream_view) {
+                if (model.hex_view) model.hex_scroll += 1;
+                if (model.stream_view) model.stream_scroll += 1;
             } else {
                 model.follow = false;
                 const count = visibleCount(model);
@@ -192,12 +222,13 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
         },
         .page_up => {
-            if (model.hex_view) {
+            if (model.hex_view or model.stream_view) {
                 const h = listHeight(model.rows);
-                if (model.hex_scroll > h) {
-                    model.hex_scroll -= h;
-                } else {
-                    model.hex_scroll = 0;
+                if (model.hex_view) {
+                    if (model.hex_scroll > h) model.hex_scroll -= h else model.hex_scroll = 0;
+                }
+                if (model.stream_view) {
+                    if (model.stream_scroll > h) model.stream_scroll -= h else model.stream_scroll = 0;
                 }
             } else {
                 model.follow = false;
@@ -211,8 +242,10 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
         },
         .page_down => {
-            if (model.hex_view) {
-                model.hex_scroll += listHeight(model.rows);
+            if (model.hex_view or model.stream_view) {
+                const h = listHeight(model.rows);
+                if (model.hex_view) model.hex_scroll += h;
+                if (model.stream_view) model.stream_scroll += h;
             } else {
                 model.follow = false;
                 const h = listHeight(model.rows);
@@ -527,7 +560,9 @@ fn view(model: *Model, r: *P.Renderer) void {
         }
     }
 
-    if (model.stats_view) {
+    if (model.stream_view) {
+        viewStream(model, r, rows, cols);
+    } else if (model.stats_view) {
         viewStats(model, r, rows, cols);
     } else if (model.hex_view) {
         viewHexDump(model, r, rows, cols);
@@ -567,6 +602,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "/", "search");
         col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
         col = writeHelpKey(r, help_row, col, "x", "hex");
+        col = writeHelpKey(r, help_row, col, "t", "stream");
         col = writeHelpKey(r, help_row, col, "s", "stats");
         col = writeHelpKey(r, help_row, col, "w", "export");
         col = writeHelpKey(r, help_row, col, "F", "follow");
@@ -667,6 +703,129 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         } else if (pkt.http_info_len > 0) {
             r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = c_peach }, .bold = true });
         }
+    }
+}
+
+fn streamMatchesPkt(model: *const Model, pkt: *const packet.PacketInfo) bool {
+    if (pkt.protocol != .tcp) return false;
+    const sa = model.stream_src[0..model.stream_src_len];
+    const da = model.stream_dst[0..model.stream_dst_len];
+    const sp = model.stream_sport;
+    const dp = model.stream_dport;
+    // Match either direction
+    const fwd = std.mem.eql(u8, pkt.srcAddr(), sa) and std.mem.eql(u8, pkt.dstAddr(), da) and pkt.src_port == sp and pkt.dst_port == dp;
+    const rev = std.mem.eql(u8, pkt.srcAddr(), da) and std.mem.eql(u8, pkt.dstAddr(), sa) and pkt.src_port == dp and pkt.dst_port == sp;
+    return fwd or rev;
+}
+
+fn extractTcpPayload(pkt: *const packet.PacketInfo) ?[]const u8 {
+    const raw = pkt.raw[0..pkt.raw_len];
+    if (raw.len < 14 + 20 + 20) return null;
+
+    const ethertype = (@as(u16, raw[12]) << 8) | raw[13];
+    const ip_hdr_len: usize = switch (ethertype) {
+        0x0800 => @as(usize, raw[14] & 0x0F) * 4,
+        0x86DD => 40,
+        else => return null,
+    };
+
+    const tcp_start = 14 + ip_hdr_len;
+    if (tcp_start + 20 > raw.len) return null;
+    const tcp_hdr_len: usize = @as(usize, raw[tcp_start + 12] >> 4) * 4;
+    const payload_start = tcp_start + tcp_hdr_len;
+    if (payload_start >= raw.len) return null;
+    return raw[payload_start..];
+}
+
+fn viewStream(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const sa = model.stream_src[0..model.stream_src_len];
+    const da = model.stream_dst[0..model.stream_dst_len];
+
+    {
+        var hbuf: [96]u8 = undefined;
+        const hs = std.fmt.bufPrint(&hbuf, "TCP Stream: {s}:{d} <-> {s}:{d}", .{
+            sa, model.stream_sport, da, model.stream_dport,
+        }) catch "";
+        r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = text_col }, .bold = true });
+    }
+    drawHLine(r, 2, cols);
+
+    // Collect output lines from stream packets
+    const visible_h = @as(usize, rows) -| 4;
+
+    // We render line by line: for each stream packet with payload,
+    // show a direction arrow + payload as printable text (one line per packet).
+    var line: usize = 0;
+    var skipped: usize = 0;
+    var total_lines: usize = 0;
+
+    for (model.packets.items) |*pkt| {
+        if (!streamMatchesPkt(model, pkt)) continue;
+        const payload = extractTcpPayload(pkt) orelse continue;
+        if (payload.len == 0) continue;
+
+        // Count lines this payload produces (one per ~(cols-4) chars)
+        const line_w = @as(usize, cols) -| 4;
+        if (line_w == 0) continue;
+        const pkt_lines = (payload.len + line_w - 1) / line_w;
+        total_lines += pkt_lines;
+
+        // Direction: is this from the "client" (stream_src) side?
+        const is_client = std.mem.eql(u8, pkt.srcAddr(), sa) and pkt.src_port == model.stream_sport;
+        const arrow: []const u8 = if (is_client) "> " else "< ";
+        const arrow_style: Style = if (is_client) .{ .fg = .{ .rgb = c_green }, .bold = true } else .{ .fg = .{ .rgb = c_blue }, .bold = true };
+        const text_style: Style = if (is_client) .{ .fg = .{ .rgb = c_green } } else .{ .fg = .{ .rgb = c_blue } };
+
+        var off: usize = 0;
+        while (off < payload.len) {
+            const chunk_end = @min(off + line_w, payload.len);
+            const chunk = payload[off..chunk_end];
+
+            if (skipped < model.stream_scroll) {
+                skipped += 1;
+                off = chunk_end;
+                continue;
+            }
+            if (line >= visible_h) {
+                // Keep counting total_lines but stop rendering
+                off = chunk_end;
+                continue;
+            }
+
+            const row: u16 = @intCast(3 + line);
+            r.writeStyledText(row, 1, if (off == 0) arrow else "  ", arrow_style);
+
+            // Render printable chars, dots for non-printable
+            var c: u16 = 3;
+            for (chunk) |b| {
+                if (c >= cols) break;
+                const ch: u21 = if (b >= 0x20 and b < 0x7F) b else '.';
+                r.applyCell(row, c, ch, text_style);
+                c += 1;
+            }
+
+            line += 1;
+            off = chunk_end;
+        }
+    }
+
+    // Scroll clamp
+    if (total_lines > visible_h) {
+        if (model.stream_scroll > total_lines - visible_h) {
+            model.stream_scroll = total_lines - visible_h;
+        }
+    } else {
+        model.stream_scroll = 0;
+    }
+
+    if (total_lines > visible_h) {
+        var sbuf: [32]u8 = undefined;
+        const ss = std.fmt.bufPrint(&sbuf, "line {d}/{d}", .{ model.stream_scroll + 1, total_lines }) catch "";
+        r.writeStyledText(rows -| 2, cols -| @as(u16, @intCast(ss.len + 1)), ss, .{ .fg = .{ .rgb = overlay0 } });
+    }
+
+    if (line == 0) {
+        r.writeStyledText(4, 1, "No payload data in this stream", detail_label_style);
     }
 }
 
