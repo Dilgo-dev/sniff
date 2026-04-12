@@ -161,10 +161,11 @@ fn listLinuxIfaces(out: []IfName) usize {
 // macOS: BPF (Berkeley Packet Filter)
 
 const bpf = if (builtin.os.tag == .macos) struct {
-    const BIOCSBLEN: c_ulong = 0xc0044266;
-    const BIOCSETIF: c_ulong = 0x8020426c;
-    const BIOCIMMEDIATE: c_ulong = 0x80044270;
-    const BIOCPROMISC: c_ulong = 0x20004269;
+    // macOS ioctl takes c_int, not c_ulong
+    const BIOCSBLEN: c_int = @bitCast(@as(c_uint, 0xc0044266));
+    const BIOCSETIF: c_int = @bitCast(@as(c_uint, 0x8020426c));
+    const BIOCIMMEDIATE: c_int = @bitCast(@as(c_uint, 0x80044270));
+    const BIOCPROMISC: c_int = @bitCast(@as(c_uint, 0x20004269));
 
     const BPF_BUF_SIZE: u32 = 65536;
 
@@ -210,7 +211,7 @@ const bpf = if (builtin.os.tag == .macos) struct {
             const fd = std.posix.open(
                 path_buf[0..path.len :0],
                 .{ .ACCMODE = .RDONLY },
-                .{},
+                @as(std.posix.mode_t, 0),
             ) catch |err| switch (err) {
                 error.DeviceBusy => continue,
                 error.AccessDenied => return error.PermissionDenied,
@@ -236,7 +237,7 @@ const bpf = if (builtin.os.tag == .macos) struct {
         _ = ioctl(fd, BIOCPROMISC, 0) catch {};
     }
 
-    fn ioctl(fd: std.posix.fd_t, request: c_ulong, arg: usize) !usize {
+    fn ioctl(fd: std.posix.fd_t, request: c_int, arg: usize) !usize {
         const rc = std.c.ioctl(fd, request, arg);
         if (rc < 0) return error.IoctlFailed;
         return @intCast(rc);
