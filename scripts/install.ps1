@@ -63,7 +63,7 @@ function Main {
         }
 
         Write-Host "installed sniff $Tag to $InstallDir\$Binary"
-        Write-Host "run as administrator: sniff"
+        Write-Host "run as administrator: $InstallDir\$Binary"
     }
     finally {
         Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
