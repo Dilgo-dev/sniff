@@ -23,6 +23,7 @@ pub const Filter = struct {
     src_host: Host = .{},
     dst_host: Host = .{},
     dns_only: bool = false,
+    http_only: bool = false,
     active: bool = false,
 
     const Host = struct {
@@ -76,6 +77,9 @@ pub const Filter = struct {
         if (self.dns_only) {
             if (pkt.dns_name_len == 0) return false;
         }
+        if (self.http_only) {
+            if (pkt.http_info_len == 0) return false;
+        }
         return true;
     }
 };
@@ -111,6 +115,11 @@ pub fn parse(expr: []const u8) ?Filter {
 
         if (std.mem.eql(u8, tok, "dns")) {
             f.dns_only = true;
+            ti += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, tok, "http")) {
+            f.http_only = true;
             ti += 1;
             continue;
         }

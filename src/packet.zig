@@ -43,6 +43,8 @@ pub const PacketInfo = struct {
     dns_name: [128]u8 = .{0} ** 128,
     dns_name_len: u8 = 0,
     dns_is_response: bool = false,
+    http_info: [128]u8 = .{0} ** 128,
+    http_info_len: u8 = 0,
     raw: [snap_len]u8 = .{0} ** snap_len,
     raw_len: u16 = 0,
 
@@ -59,6 +61,11 @@ pub const PacketInfo = struct {
     /// DNS queried domain name, if this is a DNS packet.
     pub fn dnsName(self: *const PacketInfo) []const u8 {
         return self.dns_name[0..self.dns_name_len];
+    }
+
+    /// HTTP request/response summary, if detected.
+    pub fn httpInfo(self: *const PacketInfo) []const u8 {
+        return self.http_info[0..self.http_info_len];
     }
 
     /// Format TCP flags into a human-readable string.
@@ -136,6 +143,10 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
                 info.src_port = readU16(data, 0);
                 info.dst_port = readU16(data, 2);
                 info.tcp_flags = data[13];
+                const data_off: usize = @as(usize, data[12] >> 4) * 4;
+                if (data_off >= 20 and data.len > data_off) {
+                    parseHttp(data[data_off..], info);
+                }
             }
         },
         17 => {
@@ -152,6 +163,38 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
         58 => info.protocol = .icmp6,
         else => info.protocol = .other,
     }
+}
+
+fn parseHttp(payload: []const u8, info: *PacketInfo) void {
+    if (payload.len < 10) return;
+
+    // Request: "GET /path HTTP/1.x" or "POST /path HTTP/1.x" etc.
+    // Response: "HTTP/1.x 200 OK"
+    const methods = [_][]const u8{ "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "PATCH ", "OPTIONS " };
+    for (methods) |m| {
+        if (payload.len > m.len and std.ascii.eqlIgnoreCase(payload[0..m.len], m)) {
+            const first_line = firstLine(payload);
+            setHttpInfo(info, first_line);
+            return;
+        }
+    }
+    if (payload.len > 5 and std.mem.eql(u8, payload[0..5], "HTTP/")) {
+        const first_line = firstLine(payload);
+        setHttpInfo(info, first_line);
+    }
+}
+
+fn firstLine(data: []const u8) []const u8 {
+    for (data, 0..) |b, i| {
+        if (b == '\r' or b == '\n') return data[0..i];
+    }
+    return data[0..@min(data.len, 127)];
+}
+
+fn setHttpInfo(info: *PacketInfo, line: []const u8) void {
+    const n = @min(line.len, 127);
+    @memcpy(info.http_info[0..n], line[0..n]);
+    info.http_info_len = @intCast(n);
 }
 
 fn parseDns(data: []const u8, info: *PacketInfo) void {
@@ -371,4 +414,52 @@ test "parse DNS query extracts domain name" {
     try std.testing.expectEqual(@as(u16, 53), info.dst_port);
     try std.testing.expectEqualStrings("www.google.com", info.dnsName());
     try std.testing.expect(!info.dns_is_response);
+}
+
+test "parse HTTP GET request in TCP payload" {
+    // Ethernet(14) + IPv4(20, ihl=5, proto=6) + TCP(20, data_off=5) + HTTP
+    const http_payload = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n";
+    const header_len = 14 + 20 + 20;
+    var frame: [header_len + http_payload.len]u8 = .{0} ** (header_len + http_payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6; // TCP
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    // TCP: src port 54321, dst port 80, data offset = 5 (20 bytes)
+    frame[34] = 0xD4;
+    frame[35] = 0x31;
+    frame[36] = 0x00;
+    frame[37] = 0x50;
+    frame[46] = 0x50; // data offset 5 << 4
+    @memcpy(frame[header_len..], http_payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqualStrings("GET /index.html HTTP/1.1", info.httpInfo());
+}
+
+test "parse HTTP response" {
+    const http_payload = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n";
+    const header_len = 14 + 20 + 20;
+    var frame: [header_len + http_payload.len]u8 = .{0} ** (header_len + http_payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26] = 10;
+    frame[29] = 2;
+    frame[30] = 10;
+    frame[33] = 1;
+    frame[34] = 0x00;
+    frame[35] = 0x50;
+    frame[36] = 0xD4;
+    frame[37] = 0x31;
+    frame[46] = 0x50;
+    @memcpy(frame[header_len..], http_payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", info.httpInfo());
 }
