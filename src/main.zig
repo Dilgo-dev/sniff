@@ -65,6 +65,14 @@ const Model = struct {
     stream_dst_len: u8 = 0,
     stream_sport: u16 = 0,
     stream_dport: u16 = 0,
+    graph_view: bool = false,
+    // Ring buffer of bytes-per-second for the bandwidth graph
+    bw_ring: [max_bw_samples]u32 = .{0} ** max_bw_samples,
+    bw_pps_ring: [max_bw_samples]u16 = .{0} ** max_bw_samples,
+    bw_head: usize = 0,
+    bw_last_sec: i64 = 0,
+    bw_accum_bytes: u32 = 0,
+    bw_accum_pkts: u16 = 0,
     input_mode: InputMode = .none,
     input_buf: [128]u8 = .{0} ** 128,
     input_len: u8 = 0,
@@ -76,6 +84,7 @@ const Model = struct {
 };
 
 const max_packets = 50000;
+const max_bw_samples = 300; // 5 minutes of per-second data
 
 fn init(_: std.mem.Allocator) anyerror!Model {
     return .{ .start_time = std.time.milliTimestamp() };
@@ -125,6 +134,7 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
                         }
                     }
                     model.packets.append(std.heap.page_allocator, pkt) catch {};
+                    updateBwRing(model, pkt.timestamp_ms, pkt.length);
                     if (model.follow) {
                         const count = visibleCount(model);
                         if (count > 0) {
@@ -165,16 +175,24 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 'f') openInput(model, .filter);
             if (c == '/') openInput(model, .search);
             if (c == 'w') openInput(model, .save);
+            if (c == 'b') {
+                model.graph_view = !model.graph_view;
+                model.hex_view = false;
+                model.stats_view = false;
+                model.stream_view = false;
+            }
             if (c == 's') {
                 model.stats_view = !model.stats_view;
                 model.hex_view = false;
                 model.stream_view = false;
+                model.graph_view = false;
             }
             if (c == 'x') {
                 model.hex_view = !model.hex_view;
                 model.hex_scroll = 0;
                 model.stats_view = false;
                 model.stream_view = false;
+                model.graph_view = false;
             }
             if (c == 't') {
                 if (model.stream_view) {
@@ -184,6 +202,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
                         model.stream_view = true;
                         model.hex_view = false;
                         model.stats_view = false;
+                        model.graph_view = false;
                         model.stream_scroll = 0;
                         model.stream_src = pkt.src_addr;
                         model.stream_src_len = pkt.src_addr_len;
@@ -560,7 +579,9 @@ fn view(model: *Model, r: *P.Renderer) void {
         }
     }
 
-    if (model.stream_view) {
+    if (model.graph_view) {
+        viewGraph(model, r, rows, cols);
+    } else if (model.stream_view) {
         viewStream(model, r, rows, cols);
     } else if (model.stats_view) {
         viewStats(model, r, rows, cols);
@@ -604,6 +625,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "x", "hex");
         col = writeHelpKey(r, help_row, col, "t", "stream");
         col = writeHelpKey(r, help_row, col, "s", "stats");
+        col = writeHelpKey(r, help_row, col, "b", "graph");
         col = writeHelpKey(r, help_row, col, "w", "export");
         col = writeHelpKey(r, help_row, col, "F", "follow");
         _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
@@ -703,6 +725,146 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         } else if (pkt.http_info_len > 0) {
             r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = c_peach }, .bold = true });
         }
+    }
+}
+
+fn updateBwRing(model: *Model, timestamp_ms: i64, length: u32) void {
+    const sec = @divFloor(timestamp_ms, 1000);
+    if (model.bw_last_sec == 0) model.bw_last_sec = sec;
+
+    if (sec == model.bw_last_sec) {
+        model.bw_accum_bytes +|= length;
+        model.bw_accum_pkts +|= 1;
+    } else {
+        // Flush current second
+        model.bw_ring[model.bw_head % max_bw_samples] = model.bw_accum_bytes;
+        model.bw_pps_ring[model.bw_head % max_bw_samples] = model.bw_accum_pkts;
+        model.bw_head += 1;
+
+        // Fill gaps for seconds with no traffic
+        const gap = @as(usize, @intCast(@min(sec - model.bw_last_sec - 1, max_bw_samples)));
+        var g: usize = 0;
+        while (g < gap) : (g += 1) {
+            model.bw_ring[model.bw_head % max_bw_samples] = 0;
+            model.bw_pps_ring[model.bw_head % max_bw_samples] = 0;
+            model.bw_head += 1;
+        }
+
+        model.bw_last_sec = sec;
+        model.bw_accum_bytes = length;
+        model.bw_accum_pkts = 1;
+    }
+}
+
+fn viewGraph(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    // Flush current accumulator so the live second is visible
+    const cur_sec = @divFloor(std.time.milliTimestamp(), 1000);
+    var head = model.bw_head;
+    var ring = model.bw_ring;
+    var pps_ring = model.bw_pps_ring;
+    if (cur_sec == model.bw_last_sec) {
+        ring[head % max_bw_samples] = model.bw_accum_bytes;
+        pps_ring[head % max_bw_samples] = model.bw_accum_pkts;
+        head += 1;
+    }
+
+    const sample_count = @min(head, max_bw_samples);
+    if (sample_count == 0) {
+        r.writeStyledText(2, 1, "No bandwidth data yet", detail_label_style);
+        return;
+    }
+
+    r.writeStyledText(1, 1, "Live Bandwidth (bytes/sec)", .{ .fg = .{ .rgb = text_col }, .bold = true });
+    drawHLine(r, 2, cols);
+
+    const graph_w: usize = @as(usize, cols) -| 12;
+    const graph_h: usize = @as(usize, rows) -| 8;
+    if (graph_w < 10 or graph_h < 4) return;
+
+    // Use the most recent graph_w samples
+    const show = @min(sample_count, graph_w);
+    const start_idx = if (head > show) head - show else 0;
+
+    // Find max for Y-axis scaling
+    var max_val: u32 = 1;
+    var total_bw: u64 = 0;
+    var total_pps: u64 = 0;
+    var i: usize = 0;
+    while (i < show) : (i += 1) {
+        const idx = (start_idx + i) % max_bw_samples;
+        if (ring[idx] > max_val) max_val = ring[idx];
+        total_bw += ring[idx];
+        total_pps += pps_ring[idx];
+    }
+
+    // Y-axis labels (top, mid, bottom)
+    const top_row: u16 = 3;
+    const bot_row: u16 = @intCast(3 + graph_h);
+    {
+        var lbuf: [16]u8 = undefined;
+        r.writeStyledText(top_row, 1, fmtBytesRate(max_val, &lbuf), .{ .fg = .{ .rgb = overlay0 } });
+        r.writeStyledText(bot_row, 1, "0", .{ .fg = .{ .rgb = overlay0 } });
+        const mid_row = top_row + @as(u16, @intCast(graph_h / 2));
+        r.writeStyledText(mid_row, 1, fmtBytesRate(max_val / 2, &lbuf), .{ .fg = .{ .rgb = overlay0 } });
+    }
+
+    // Block characters for sub-cell resolution (eighths)
+    const blocks = [_]u21{ ' ', 0x2581, 0x2582, 0x2583, 0x2584, 0x2585, 0x2586, 0x2587, 0x2588 };
+    const bar_col: u16 = 10;
+
+    i = 0;
+    while (i < show) : (i += 1) {
+        const idx = (start_idx + i) % max_bw_samples;
+        const val = ring[idx];
+        const col_x: u16 = bar_col + @as(u16, @intCast(i));
+        if (col_x >= cols) break;
+
+        // Scale value to graph_h * 8 (sub-cell units)
+        const scaled: usize = if (max_val > 0)
+            @as(usize, val) * graph_h * 8 / max_val
+        else
+            0;
+        const full_rows = scaled / 8;
+        const frac = scaled % 8;
+
+        // Draw from bottom up
+        var gy: usize = 0;
+        while (gy < graph_h) : (gy += 1) {
+            const draw_row: u16 = bot_row - @as(u16, @intCast(gy));
+            if (gy < full_rows) {
+                r.applyCell(draw_row, col_x, 0x2588, .{ .fg = .{ .rgb = c_green } });
+            } else if (gy == full_rows and frac > 0) {
+                r.applyCell(draw_row, col_x, blocks[frac], .{ .fg = .{ .rgb = c_green } });
+            }
+        }
+    }
+
+    // Summary below the graph
+    const info_row: u16 = bot_row + 1;
+    drawHLine(r, info_row, cols);
+    {
+        const avg_bw: u64 = if (show > 0) total_bw / show else 0;
+        const avg_pps: u64 = if (show > 0) total_pps / show else 0;
+        var abuf: [16]u8 = undefined;
+        var mbuf: [16]u8 = undefined;
+        var sbuf: [80]u8 = undefined;
+        const ss = std.fmt.bufPrint(&sbuf, "avg: {s}/s  peak: {s}/s  {d} pps avg  {d}s window", .{
+            fmtBytesRate(@intCast(avg_bw), &abuf),
+            fmtBytesRate(max_val, &mbuf),
+            avg_pps,
+            show,
+        }) catch "";
+        r.writeStyledText(info_row + 1, 1, ss, .{ .fg = .{ .rgb = subtext0 } });
+    }
+}
+
+fn fmtBytesRate(bytes: u32, buf: *[16]u8) []const u8 {
+    if (bytes >= 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d}.{d}MB", .{ bytes / (1024 * 1024), (bytes / (1024 * 100)) % 10 }) catch "";
+    } else if (bytes >= 1024) {
+        return std.fmt.bufPrint(buf, "{d}.{d}KB", .{ bytes / 1024, (bytes / 100) % 10 }) catch "";
+    } else {
+        return std.fmt.bufPrint(buf, "{d}B", .{bytes}) catch "";
     }
 }
 
