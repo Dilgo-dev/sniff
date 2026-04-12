@@ -40,7 +40,7 @@ const App = union(enum) {
 
 const P = glym.Program(Model, App);
 
-const InputMode = enum { none, filter, search, export };
+const InputMode = enum { none, filter, search, save };
 
 const Model = struct {
     packets: std.ArrayList(packet.PacketInfo) = .{},
@@ -60,6 +60,9 @@ const Model = struct {
     search_buf: [128]u8 = .{0} ** 128,
     search_len: u8 = 0,
     search_active: bool = false,
+    // Hex dump
+    hex_view: bool = false,
+    hex_scroll: usize = 0,
     // Shared input state
     input_mode: InputMode = .none,
     input_buf: [128]u8 = .{0} ** 128,
@@ -167,41 +170,66 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
             if (c == 'f') openInput(model, .filter);
             if (c == '/') openInput(model, .search);
-            if (c == 'w') openInput(model, .export);
+            if (c == 'w') openInput(model, .save);
+            if (c == 'x') {
+                model.hex_view = !model.hex_view;
+                model.hex_scroll = 0;
+            }
             if (c == 'n') searchNext(model, true);
             if (c == 'N') searchNext(model, false);
             if (c == 'F') model.follow = !model.follow;
         },
         .arrow_up => {
-            model.follow = false;
-            if (model.selected > 0) model.selected -= 1;
-            adjustScroll(model);
+            if (model.hex_view) {
+                if (model.hex_scroll > 0) model.hex_scroll -= 1;
+            } else {
+                model.follow = false;
+                if (model.selected > 0) model.selected -= 1;
+                adjustScroll(model);
+            }
         },
         .arrow_down => {
-            model.follow = false;
-            const count = visibleCount(model);
-            if (count > 0 and model.selected < count - 1) {
-                model.selected += 1;
-                adjustScroll(model);
+            if (model.hex_view) {
+                model.hex_scroll += 1;
+            } else {
+                model.follow = false;
+                const count = visibleCount(model);
+                if (count > 0 and model.selected < count - 1) {
+                    model.selected += 1;
+                    adjustScroll(model);
+                }
             }
         },
         .page_up => {
-            model.follow = false;
-            const h = listHeight(model.rows);
-            if (model.selected > h) {
-                model.selected -= h;
+            if (model.hex_view) {
+                const h = listHeight(model.rows);
+                if (model.hex_scroll > h) {
+                    model.hex_scroll -= h;
+                } else {
+                    model.hex_scroll = 0;
+                }
             } else {
-                model.selected = 0;
+                model.follow = false;
+                const h = listHeight(model.rows);
+                if (model.selected > h) {
+                    model.selected -= h;
+                } else {
+                    model.selected = 0;
+                }
+                adjustScroll(model);
             }
-            adjustScroll(model);
         },
         .page_down => {
-            model.follow = false;
-            const h = listHeight(model.rows);
-            const count = visibleCount(model);
-            if (count > 0) {
-                model.selected = @min(model.selected + h, count - 1);
-                adjustScroll(model);
+            if (model.hex_view) {
+                model.hex_scroll += listHeight(model.rows);
+            } else {
+                model.follow = false;
+                const h = listHeight(model.rows);
+                const count = visibleCount(model);
+                if (count > 0) {
+                    model.selected = @min(model.selected + h, count - 1);
+                    adjustScroll(model);
+                }
             }
         },
         else => {},
@@ -221,7 +249,7 @@ fn openInput(model: *Model, mode: InputMode) void {
             @memcpy(model.input_buf[0..model.search_len], model.search_buf[0..model.search_len]);
             model.input_len = model.search_len;
         },
-        .export => {
+        .save => {
             const default = "capture.pcap";
             @memcpy(model.input_buf[0..default.len], default);
             model.input_len = default.len;
@@ -243,7 +271,7 @@ fn handleTextInput(model: *Model, k: glym.input.Key) void {
             switch (mode) {
                 .filter => applyFilter(model),
                 .search => applySearch(model),
-                .export => applyExport(model),
+                .save => applyExport(model),
                 .none => {},
             }
         },
@@ -516,10 +544,55 @@ fn view(model: *Model, r: *P.Renderer) void {
         }
     }
 
+    if (model.hex_view) {
+        viewHexDump(model, r, rows, cols);
+    } else {
+        viewPacketList(model, r, rows, cols);
+    }
+
+    // Help bar / filter input
+    const help_row: u16 = rows - 1;
+    r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
+    if (model.input_mode != .none) {
+        const prompt: []const u8 = switch (model.input_mode) {
+            .filter => "filter: ",
+            .search => "search: ",
+            .save => "export: ",
+            .none => "",
+        };
+        const prompt_style: Style = if (model.input_error)
+            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true }
+        else switch (model.input_mode) {
+            .search => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true },
+            .save => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true },
+            else => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true },
+        };
+        r.writeStyledText(help_row, 1, prompt, prompt_style);
+        const plen: u16 = @intCast(prompt.len);
+        const text = model.input_buf[0..model.input_len];
+        r.writeStyledText(help_row, 1 + plen, text, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
+        // Cursor block
+        const ccol: u16 = 1 + plen + @as(u16, model.input_cursor);
+        const cch: u21 = if (model.input_cursor < model.input_len) model.input_buf[model.input_cursor] else ' ';
+        r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
+        r.writeStyledText(help_row, cols -| 22, "enter:apply esc:cancel", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+    } else {
+        var col: u16 = 1;
+        col = writeHelpKey(r, help_row, col, "q", "quit");
+        col = writeHelpKey(r, help_row, col, "p", "pause");
+        col = writeHelpKey(r, help_row, col, "f", "filter");
+        col = writeHelpKey(r, help_row, col, "/", "search");
+        col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
+        col = writeHelpKey(r, help_row, col, "x", "hex");
+        col = writeHelpKey(r, help_row, col, "w", "export");
+        col = writeHelpKey(r, help_row, col, "F", "follow");
+        _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
+    }
+}
+
+fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     // Column headers
     writeColumns(r, 1, cols, "#", "Time", "Source", "Destination", "Proto", "Len", header_style);
-
-    // Separator
     drawHLine(r, 2, cols);
 
     // Packet list
@@ -552,7 +625,6 @@ fn view(model: *Model, r: *P.Renderer) void {
 
             writeColumns(r, row, cols, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protocol.name(), len_s, row_style);
 
-            // Protocol column with color
             const pcol = protoCol(cols);
             const ps = protoStyle(pkt.protocol);
             const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = ps.fg, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = ps.fg } else .{ .fg = ps.fg };
@@ -609,43 +681,95 @@ fn view(model: *Model, r: *P.Renderer) void {
             r.writeStyledText(d2, 49, flags, .{ .fg = .{ .rgb = c_peach } });
         }
     }
+}
 
-    // Help bar / filter input
-    const help_row: u16 = rows - 1;
-    r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
-    if (model.input_mode != .none) {
-        const prompt: []const u8 = switch (model.input_mode) {
-            .filter => "filter: ",
-            .search => "search: ",
-            .export => "export: ",
-            .none => "",
-        };
-        const prompt_style: Style = if (model.input_error)
-            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true }
-        else switch (model.input_mode) {
-            .search => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true },
-            .export => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true },
-            else => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true },
-        };
-        r.writeStyledText(help_row, 1, prompt, prompt_style);
-        const plen: u16 = @intCast(prompt.len);
-        const text = model.input_buf[0..model.input_len];
-        r.writeStyledText(help_row, 1 + plen, text, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
-        // Cursor block
-        const ccol: u16 = 1 + plen + @as(u16, model.input_cursor);
-        const cch: u21 = if (model.input_cursor < model.input_len) model.input_buf[model.input_cursor] else ' ';
-        r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
-        r.writeStyledText(help_row, cols -| 22, "enter:apply esc:cancel", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const pkt = getVisible(model, model.selected) orelse {
+        r.writeStyledText(2, 1, "No packet selected", detail_label_style);
+        return;
+    };
+
+    // Header: packet summary
+    {
+        var hbuf: [80]u8 = undefined;
+        const hs = std.fmt.bufPrint(&hbuf, "Packet #{d}  {s}:{d} -> {s}:{d}  {s}  {d} bytes", .{
+            model.selected + 1,
+            pkt.srcAddr(),
+            pkt.src_port,
+            pkt.dstAddr(),
+            pkt.dst_port,
+            pkt.protocol.name(),
+            pkt.raw_len,
+        }) catch "";
+        r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = text_col }, .bold = true });
+    }
+    drawHLine(r, 2, cols);
+
+    // Hex dump layout:
+    // OFFSET   00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F  |ASCII...........|
+    const bytes_per_line: usize = 16;
+    const raw = pkt.raw[0..pkt.raw_len];
+    const total_lines = (raw.len + bytes_per_line - 1) / bytes_per_line;
+    const visible = @as(usize, rows) -| 4; // rows 3..rows-2
+
+    // Clamp scroll
+    if (total_lines > visible) {
+        if (model.hex_scroll > total_lines - visible) {
+            model.hex_scroll = total_lines - visible;
+        }
     } else {
-        var col: u16 = 1;
-        col = writeHelpKey(r, help_row, col, "q", "quit");
-        col = writeHelpKey(r, help_row, col, "p", "pause");
-        col = writeHelpKey(r, help_row, col, "f", "filter");
-        col = writeHelpKey(r, help_row, col, "/", "search");
-        col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
-        col = writeHelpKey(r, help_row, col, "w", "export");
-        col = writeHelpKey(r, help_row, col, "F", "follow");
-        _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
+        model.hex_scroll = 0;
+    }
+
+    const offset_style: Style = .{ .fg = .{ .rgb = overlay0 } };
+    const hex_style: Style = .{ .fg = .{ .rgb = c_blue } };
+    const ascii_style: Style = .{ .fg = .{ .rgb = c_green } };
+    const dot_style: Style = .{ .fg = .{ .rgb = overlay0 } };
+
+    var line_idx: usize = 0;
+    while (line_idx < visible) : (line_idx += 1) {
+        const data_line = model.hex_scroll + line_idx;
+        const row: u16 = @intCast(3 + line_idx);
+        const byte_offset = data_line * bytes_per_line;
+        if (byte_offset >= raw.len) break;
+
+        const line_end = @min(byte_offset + bytes_per_line, raw.len);
+        const line_bytes = raw[byte_offset..line_end];
+
+        // Offset column
+        var off_buf: [8]u8 = undefined;
+        const off_s = std.fmt.bufPrint(&off_buf, "{X:0>4}", .{byte_offset}) catch "";
+        r.writeStyledText(row, 1, off_s, offset_style);
+
+        // Hex bytes
+        var hcol: u16 = 7;
+        for (line_bytes, 0..) |b, bi| {
+            var hb: [3]u8 = undefined;
+            _ = std.fmt.bufPrint(&hb, "{X:0>2} ", .{b}) catch {};
+            r.writeStyledText(row, hcol, hb[0..2], hex_style);
+            hcol += 3;
+            if (bi == 7) {
+                r.writeStyledText(row, hcol, " ", offset_style);
+                hcol += 1;
+            }
+        }
+
+        // ASCII column
+        const ascii_col: u16 = 7 + 3 * 16 + 2;
+        r.writeStyledText(row, ascii_col, "|", offset_style);
+        for (line_bytes, 0..) |b, bi| {
+            const ch: u21 = if (b >= 0x20 and b < 0x7F) b else '.';
+            const sty = if (b >= 0x20 and b < 0x7F) ascii_style else dot_style;
+            r.applyCell(row, ascii_col + 1 + @as(u16, @intCast(bi)), ch, sty);
+        }
+        r.writeStyledText(row, ascii_col + 1 + @as(u16, @intCast(line_bytes.len)), "|", offset_style);
+    }
+
+    // Scroll indicator
+    if (total_lines > visible) {
+        var sbuf: [32]u8 = undefined;
+        const ss = std.fmt.bufPrint(&sbuf, "line {d}/{d}", .{ model.hex_scroll + 1, total_lines }) catch "";
+        r.writeStyledText(rows -| 2, cols -| @as(u16, @intCast(ss.len + 1)), ss, offset_style);
     }
 }
 
