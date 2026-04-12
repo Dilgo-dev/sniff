@@ -13,9 +13,9 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("glym", glym_dep.module("glym"));
 
-    // Windows needs Npcap's wpcap.dll for packet capture
+    // Windows uses raw sockets via ws2_32 (no extra install)
     if (target.result.os.tag == .windows) {
-        exe_mod.linkSystemLibrary("wpcap", .{});
+        exe_mod.linkSystemLibrary("ws2_32", .{});
     }
 
     const exe = b.addExecutable(.{

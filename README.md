@@ -20,17 +20,21 @@ Built on [glymmi/glym](https://github.com/glymmi/glym), a TUI framework for Zig 
 
 ## Platform support
 
-| Platform | Capture backend            | Extra dependency |
-|----------|---------------------------|------------------|
-| Linux    | AF_PACKET raw socket       | None             |
-| macOS    | BPF (`/dev/bpfN` on en0)  | None             |
-| Windows  | Npcap (`wpcap.dll`)        | [Npcap](https://npcap.com) |
+| Platform | Capture backend             | Extra dependency |
+|----------|-----------------------------|------------------|
+| Linux    | AF_PACKET raw socket        | None             |
+| macOS    | BPF (`/dev/bpfN` on en0)   | None             |
+| Windows  | Raw socket + `SIO_RCVALL`  | None             |
+
+Zero external dependencies on all platforms. Build and run.
+
+> **Note:** Windows captures IP-level traffic only (no ARP). Linux and macOS
+> capture full Ethernet frames.
 
 ## Requirements
 
 - Zig 0.15+
 - Root / sudo (Linux, macOS) or Administrator (Windows)
-- Windows only: [Npcap](https://npcap.com) installed
 
 ## Build and run
 
