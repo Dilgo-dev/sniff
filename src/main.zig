@@ -39,6 +39,7 @@ const Model = struct {
     selected: usize = 0,
     scroll: usize = 0,
     paused: bool = false,
+    follow: bool = true,
     started: bool = false,
     rows: u16 = 24,
     cols: u16 = 80,
@@ -94,6 +95,13 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
                         }
                     }
                     model.packets.append(std.heap.page_allocator, pkt) catch {};
+                    if (model.follow) {
+                        const count = visibleCount(model);
+                        if (count > 0) {
+                            model.selected = count - 1;
+                            adjustScroll(model);
+                        }
+                    }
                 }
                 return .{ .async_task = captureOne };
             },
@@ -116,10 +124,12 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 'q' or (c == 'c' and k.modifiers.ctrl)) return .quit;
             if (c == 'p') model.paused = !model.paused;
             if (c == 'g') {
+                model.follow = false;
                 model.selected = 0;
                 model.scroll = 0;
             }
             if (c == 'G') {
+                model.follow = true;
                 const count = visibleCount(model);
                 if (count > 0) {
                     model.selected = count - 1;
@@ -127,12 +137,15 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
                 }
             }
             if (c == 'f') cycleFilter(model);
+            if (c == 'F') model.follow = !model.follow;
         },
         .arrow_up => {
+            model.follow = false;
             if (model.selected > 0) model.selected -= 1;
             adjustScroll(model);
         },
         .arrow_down => {
+            model.follow = false;
             const count = visibleCount(model);
             if (count > 0 and model.selected < count - 1) {
                 model.selected += 1;
@@ -140,6 +153,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
         },
         .page_up => {
+            model.follow = false;
             const h = listHeight(model.rows);
             if (model.selected > h) {
                 model.selected -= h;
@@ -149,6 +163,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             adjustScroll(model);
         },
         .page_down => {
+            model.follow = false;
             const h = listHeight(model.rows);
             const count = visibleCount(model);
             if (count > 0) {
@@ -263,6 +278,8 @@ fn view(model: *Model, r: *P.Renderer) void {
     }
     if (model.paused) {
         r.writeStyledText(0, cols -| 10, " PAUSED ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true });
+    } else if (model.follow) {
+        r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
     }
     if (model.filter_proto) |fp| {
         var fbuf: [16]u8 = undefined;
@@ -366,6 +383,7 @@ fn view(model: *Model, r: *P.Renderer) void {
     col = writeHelpKey(r, help_row, col, "q", "quit");
     col = writeHelpKey(r, help_row, col, "p", "pause");
     col = writeHelpKey(r, help_row, col, "f", "filter");
+    col = writeHelpKey(r, help_row, col, "F", "follow");
     col = writeHelpKey(r, help_row, col, "g/G", "top/bottom");
     _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
 }
