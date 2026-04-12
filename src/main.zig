@@ -83,6 +83,7 @@ const Model = struct {
     status_time: i64 = 0,
 };
 
+const version = "0.1.0";
 const max_packets = 50000;
 const max_bw_samples = 300; // 5 minutes of per-second data
 
@@ -1333,6 +1334,33 @@ fn activeIfaceSlice() []const u8 {
     return active_iface[0..active_iface_len];
 }
 
+fn runUpdate() !void {
+    std.debug.print("sniff update - checking for latest release...\n", .{});
+    if (builtin.os.tag == .windows) {
+        // PowerShell: download and run install script
+        var child = std.process.Child.init(
+            &.{ "powershell", "-NoProfile", "-Command", "irm https://getsniff.sh/install.ps1 | iex" },
+            std.heap.page_allocator,
+        );
+        child.term = .{ .Exited = 0 };
+        _ = child.spawnAndWait() catch {
+            std.debug.print("error: failed to run powershell installer\n", .{});
+            std.process.exit(1);
+        };
+    } else {
+        // POSIX: curl | sh
+        var child = std.process.Child.init(
+            &.{ "sh", "-c", "curl -fsSL https://getsniff.sh/install | sh" },
+            std.heap.page_allocator,
+        );
+        child.term = .{ .Exited = 0 };
+        _ = child.spawnAndWait() catch {
+            std.debug.print("error: failed to run install script\n", .{});
+            std.process.exit(1);
+        };
+    }
+}
+
 pub fn main() !void {
     var iface_arg: ?[]const u8 = null;
     var list_mode = false;
@@ -1348,16 +1376,26 @@ pub fn main() !void {
             if (ai < argv.len) {
                 iface_arg = std.mem.span(argv[ai]);
             }
+        } else if (std.mem.eql(u8, arg, "update")) {
+            return runUpdate();
+        } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("sniff {s}\n", .{version});
+            return;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
                 \\sniff - terminal packet sniffer
                 \\
                 \\Usage: sniff [options]
+                \\       sniff update
                 \\
                 \\Options:
-                \\  -l, --list    List available network interfaces
-                \\  -i <iface>    Capture on a specific interface
-                \\  -h, --help    Show this help
+                \\  -l, --list       List available network interfaces
+                \\  -i <iface>       Capture on a specific interface
+                \\  -V, --version    Show version
+                \\  -h, --help       Show this help
+                \\
+                \\Commands:
+                \\  update           Download and install the latest release
                 \\
                 \\Without -i, captures on all interfaces (Linux) or default (macOS/Windows).
                 \\Requires root/sudo (Linux, macOS) or Administrator (Windows).
