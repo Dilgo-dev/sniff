@@ -48,24 +48,24 @@ main() {
   echo "sniff $TAG ($OS/$ARCH)"
   echo "downloading $URL"
 
-  TMPDIR=$(mktemp -d)
-  trap 'rm -rf "$TMPDIR"' EXIT
+  WORKDIR=$(mktemp -d)
+  trap 'rm -rf "$WORKDIR"' EXIT
 
-  curl -fsSL "$URL" -o "$TMPDIR/$ASSET"
-  tar xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
+  curl -fsSL "$URL" -o "$WORKDIR/$ASSET"
+  tar xzf "$WORKDIR/$ASSET" -C "$WORKDIR"
 
-  if [ ! -f "$TMPDIR/$BINARY" ]; then
+  if [ ! -f "$WORKDIR/$BINARY" ]; then
     echo "error: binary not found in archive"
     exit 1
   fi
 
-  chmod +x "$TMPDIR/$BINARY"
+  chmod +x "$WORKDIR/$BINARY"
 
   if [ -w "$INSTALL_DIR" ]; then
-    mv "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
+    mv "$WORKDIR/$BINARY" "$INSTALL_DIR/$BINARY"
   else
     echo "installing to $INSTALL_DIR (requires sudo)"
-    sudo mv "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
+    sudo mv "$WORKDIR/$BINARY" "$INSTALL_DIR/$BINARY"
   fi
 
   echo "installed sniff $TAG to $INSTALL_DIR/$BINARY"
