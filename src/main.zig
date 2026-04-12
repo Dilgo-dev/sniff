@@ -35,6 +35,8 @@ const App = union(enum) {
 
 const P = glym.Program(Model, App);
 
+const InputMode = enum { none, filter, search };
+
 const Model = struct {
     packets: std.ArrayList(packet.PacketInfo) = .{},
     selected: usize = 0,
@@ -45,12 +47,20 @@ const Model = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     start_time: i64 = 0,
+    // Filter
     filter: filter_mod.Filter = .{},
-    filter_input: bool = false,
     filter_buf: [128]u8 = .{0} ** 128,
     filter_len: u8 = 0,
-    filter_cursor: u8 = 0,
-    filter_error: bool = false,
+    // Search
+    search_buf: [128]u8 = .{0} ** 128,
+    search_len: u8 = 0,
+    search_active: bool = false,
+    // Shared input state
+    input_mode: InputMode = .none,
+    input_buf: [128]u8 = .{0} ** 128,
+    input_len: u8 = 0,
+    input_cursor: u8 = 0,
+    input_error: bool = false,
 };
 
 const max_packets = 50000;
@@ -72,8 +82,8 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
             model.cols = sz.cols;
         },
         .key => |k| {
-            if (model.filter_input) {
-                handleFilterInput(model, k);
+            if (model.input_mode != .none) {
+                handleTextInput(model, k);
             } else {
                 switch (handleKey(model, k)) {
                     .quit => return .quit,
@@ -146,10 +156,10 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
                     adjustScroll(model);
                 }
             }
-            if (c == '/' or c == 'f') {
-                model.filter_input = true;
-                model.filter_error = false;
-            }
+            if (c == 'f') openInput(model, .filter);
+            if (c == '/') openInput(model, .search);
+            if (c == 'n') searchNext(model, true);
+            if (c == 'N') searchNext(model, false);
             if (c == 'F') model.follow = !model.follow;
         },
         .arrow_up => {
@@ -189,59 +199,149 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
     return .none;
 }
 
-fn handleFilterInput(model: *Model, k: glym.input.Key) void {
+fn openInput(model: *Model, mode: InputMode) void {
+    model.input_mode = mode;
+    model.input_error = false;
+    // Pre-fill with current value
+    switch (mode) {
+        .filter => {
+            @memcpy(model.input_buf[0..model.filter_len], model.filter_buf[0..model.filter_len]);
+            model.input_len = model.filter_len;
+        },
+        .search => {
+            @memcpy(model.input_buf[0..model.search_len], model.search_buf[0..model.search_len]);
+            model.input_len = model.search_len;
+        },
+        .none => {},
+    }
+    model.input_cursor = model.input_len;
+}
+
+fn handleTextInput(model: *Model, k: glym.input.Key) void {
     switch (k.code) {
         .escape => {
-            model.filter_input = false;
-            model.filter_error = false;
+            model.input_mode = .none;
+            model.input_error = false;
         },
         .enter => {
-            model.filter_input = false;
-            const expr = model.filter_buf[0..model.filter_len];
-            if (expr.len == 0) {
-                model.filter = .{};
-                model.filter_error = false;
-            } else if (filter_mod.parse(expr)) |f| {
-                model.filter = f;
-                model.filter_error = false;
-            } else {
-                model.filter_error = true;
+            const mode = model.input_mode;
+            model.input_mode = .none;
+            switch (mode) {
+                .filter => applyFilter(model),
+                .search => applySearch(model),
+                .none => {},
             }
-            model.selected = 0;
-            model.scroll = 0;
         },
         .backspace => {
-            if (model.filter_cursor > 0) {
-                model.filter_cursor -= 1;
-                // Shift remaining chars left
-                var i: usize = model.filter_cursor;
-                while (i + 1 < model.filter_len) : (i += 1) {
-                    model.filter_buf[i] = model.filter_buf[i + 1];
+            if (model.input_cursor > 0) {
+                model.input_cursor -= 1;
+                var i: usize = model.input_cursor;
+                while (i + 1 < model.input_len) : (i += 1) {
+                    model.input_buf[i] = model.input_buf[i + 1];
                 }
-                model.filter_len -= 1;
-                model.filter_error = false;
+                model.input_len -= 1;
+                model.input_error = false;
             }
         },
         .char => |c| {
-            if (c > 0 and c < 128 and model.filter_len < 127) {
-                // Shift chars right to make room
-                var i: usize = model.filter_len;
-                while (i > model.filter_cursor) : (i -= 1) {
-                    model.filter_buf[i] = model.filter_buf[i - 1];
+            if (c > 0 and c < 128 and model.input_len < 127) {
+                var i: usize = model.input_len;
+                while (i > model.input_cursor) : (i -= 1) {
+                    model.input_buf[i] = model.input_buf[i - 1];
                 }
-                model.filter_buf[model.filter_cursor] = @intCast(c);
-                model.filter_cursor += 1;
-                model.filter_len += 1;
-                model.filter_error = false;
+                model.input_buf[model.input_cursor] = @intCast(c);
+                model.input_cursor += 1;
+                model.input_len += 1;
+                model.input_error = false;
             }
         },
         .arrow_left => {
-            if (model.filter_cursor > 0) model.filter_cursor -= 1;
+            if (model.input_cursor > 0) model.input_cursor -= 1;
         },
         .arrow_right => {
-            if (model.filter_cursor < model.filter_len) model.filter_cursor += 1;
+            if (model.input_cursor < model.input_len) model.input_cursor += 1;
         },
         else => {},
+    }
+}
+
+fn applyFilter(model: *Model) void {
+    const expr = model.input_buf[0..model.input_len];
+    @memcpy(model.filter_buf[0..model.input_len], expr);
+    model.filter_len = model.input_len;
+    if (expr.len == 0) {
+        model.filter = .{};
+        model.input_error = false;
+    } else if (filter_mod.parse(expr)) |f| {
+        model.filter = f;
+        model.input_error = false;
+    } else {
+        model.input_error = true;
+    }
+    model.selected = 0;
+    model.scroll = 0;
+}
+
+fn applySearch(model: *Model) void {
+    const term = model.input_buf[0..model.input_len];
+    @memcpy(model.search_buf[0..model.input_len], term);
+    model.search_len = model.input_len;
+    model.search_active = model.input_len > 0;
+    if (model.search_active) {
+        // Jump to first match from current position
+        searchNext(model, true);
+    }
+}
+
+fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
+    if (!model.search_active) return false;
+    const term = model.search_buf[0..model.search_len];
+    // Match against addresses
+    if (containsSubstring(pkt.srcAddr(), term)) return true;
+    if (containsSubstring(pkt.dstAddr(), term)) return true;
+    // Match against ports as strings
+    var pbuf: [8]u8 = undefined;
+    if (pkt.src_port > 0) {
+        const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.src_port}) catch "";
+        if (containsSubstring(ps, term)) return true;
+    }
+    if (pkt.dst_port > 0) {
+        const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.dst_port}) catch "";
+        if (containsSubstring(ps, term)) return true;
+    }
+    // Match against protocol name
+    if (containsSubstring(pkt.protocol.name(), term)) return true;
+    return false;
+}
+
+fn containsSubstring(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn searchNext(model: *Model, forward: bool) void {
+    if (!model.search_active) return;
+    const count = visibleCount(model);
+    if (count == 0) return;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const idx = if (forward)
+            (model.selected + 1 + i) % count
+        else
+            (model.selected + count - 1 - i) % count;
+        if (getVisible(model, idx)) |pkt| {
+            if (searchMatches(model, &pkt)) {
+                model.follow = false;
+                model.selected = idx;
+                adjustScroll(model);
+                return;
+            }
+        }
     }
 }
 
@@ -295,6 +395,7 @@ const c_yellow: Rgb = .{ .r = 249, .g = 226, .b = 175 };
 const c_mauve: Rgb = .{ .r = 203, .g = 166, .b = 247 };
 const c_peach: Rgb = .{ .r = 250, .g = 179, .b = 135 };
 const c_red: Rgb = .{ .r = 243, .g = 139, .b = 168 };
+const search_bg: Rgb = .{ .r = 62, .g = 56, .b = 30 }; // dark warm tint for search matches
 
 const title_style: Style = .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col }, .bold = true };
 const header_style: Style = .{ .fg = .{ .rgb = subtext0 }, .bold = true };
@@ -339,9 +440,22 @@ fn view(model: *Model, r: *P.Renderer) void {
     } else if (model.follow) {
         r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
     }
-    if (model.filter.active) {
-        const expr = model.filter_buf[0..model.filter_len];
-        r.writeStyledText(0, cols / 2 -| @as(u16, @intCast(expr.len / 2)), expr, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_peach }, .bold = true });
+    // Active filter/search indicators in title bar
+    {
+        var info_col: u16 = cols / 3;
+        if (model.filter.active) {
+            r.writeStyledText(0, info_col, "filter:", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+            info_col += 7;
+            const expr = model.filter_buf[0..model.filter_len];
+            r.writeStyledText(0, info_col, expr, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_peach }, .bold = true });
+            info_col += @as(u16, @intCast(expr.len)) + 2;
+        }
+        if (model.search_active) {
+            r.writeStyledText(0, info_col, "/", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+            info_col += 1;
+            const term = model.search_buf[0..model.search_len];
+            r.writeStyledText(0, info_col, term, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true });
+        }
     }
 
     // Column headers
@@ -359,9 +473,14 @@ fn view(model: *Model, r: *P.Renderer) void {
         const is_selected = pkt_idx == model.selected;
 
         if (getVisible(model, pkt_idx)) |pkt| {
-            const row_style = if (is_selected) selected_style else normal_style;
-            if (is_selected) {
-                r.fillRect(row, 0, 1, cols, .{ .char = ' ', .style = selected_style });
+            const is_match = searchMatches(model, &pkt);
+            const row_bg: Rgb = if (is_selected) surface1 else if (is_match) search_bg else surface0;
+            const row_style: Style = if (is_selected or is_match)
+                .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = text_col } }
+            else
+                normal_style;
+            if (is_selected or is_match) {
+                r.fillRect(row, 0, 1, cols, .{ .char = ' ', .style = .{ .bg = .{ .rgb = row_bg } } });
             }
 
             var num_buf: [8]u8 = undefined;
@@ -378,7 +497,7 @@ fn view(model: *Model, r: *P.Renderer) void {
             // Protocol column with color
             const pcol = protoCol(cols);
             const ps = protoStyle(pkt.protocol);
-            const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = surface1 }, .fg = ps.fg, .bold = true } else .{ .fg = ps.fg };
+            const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = ps.fg, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = ps.fg } else .{ .fg = ps.fg };
             r.writeStyledText(row, pcol, pkt.protocol.name(), pstyle);
         } else {
             break;
@@ -436,26 +555,31 @@ fn view(model: *Model, r: *P.Renderer) void {
     // Help bar / filter input
     const help_row: u16 = rows - 1;
     r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
-    if (model.filter_input) {
-        const prompt_style: Style = if (model.filter_error)
+    if (model.input_mode != .none) {
+        const prompt: []const u8 = if (model.input_mode == .filter) "filter: " else "search: ";
+        const prompt_style: Style = if (model.input_error)
             .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true }
+        else if (model.input_mode == .search)
+            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true }
         else
             .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true };
-        r.writeStyledText(help_row, 1, "filter: ", prompt_style);
-        const expr = model.filter_buf[0..model.filter_len];
-        r.writeStyledText(help_row, 9, expr, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
-        // Cursor
-        const cursor_col: u16 = 9 + @as(u16, model.filter_cursor);
-        r.applyCell(help_row, cursor_col, if (model.filter_cursor < model.filter_len) model.filter_buf[model.filter_cursor] else ' ', .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
-        // Hint
-        r.writeStyledText(help_row, cols -| 20, "enter:apply esc:cancel", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+        r.writeStyledText(help_row, 1, prompt, prompt_style);
+        const plen: u16 = @intCast(prompt.len);
+        const text = model.input_buf[0..model.input_len];
+        r.writeStyledText(help_row, 1 + plen, text, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
+        // Cursor block
+        const ccol: u16 = 1 + plen + @as(u16, model.input_cursor);
+        const cch: u21 = if (model.input_cursor < model.input_len) model.input_buf[model.input_cursor] else ' ';
+        r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
+        r.writeStyledText(help_row, cols -| 22, "enter:apply esc:cancel", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
     } else {
         var col: u16 = 1;
         col = writeHelpKey(r, help_row, col, "q", "quit");
         col = writeHelpKey(r, help_row, col, "p", "pause");
-        col = writeHelpKey(r, help_row, col, "/", "filter");
+        col = writeHelpKey(r, help_row, col, "f", "filter");
+        col = writeHelpKey(r, help_row, col, "/", "search");
+        col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
         col = writeHelpKey(r, help_row, col, "F", "follow");
-        col = writeHelpKey(r, help_row, col, "g/G", "top/bottom");
         _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
     }
 }
