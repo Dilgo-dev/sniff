@@ -22,6 +22,7 @@ pub const Filter = struct {
     host: Host = .{},
     src_host: Host = .{},
     dst_host: Host = .{},
+    dns_only: bool = false,
     active: bool = false,
 
     const Host = struct {
@@ -72,6 +73,9 @@ pub const Filter = struct {
             if (!std.mem.eql(u8, pkt.dstAddr(), self.dst_host.slice()))
                 return false;
         }
+        if (self.dns_only) {
+            if (pkt.dns_name_len == 0) return false;
+        }
         return true;
     }
 };
@@ -103,6 +107,13 @@ pub fn parse(expr: []const u8) ?Filter {
 
         // Skip "and" conjunctions
         if (std.mem.eql(u8, tok, "and") or std.mem.eql(u8, tok, "&&")) {
+            ti += 1;
+            continue;
+        }
+
+        // DNS shorthand
+        if (std.mem.eql(u8, tok, "dns")) {
+            f.dns_only = true;
             ti += 1;
             continue;
         }

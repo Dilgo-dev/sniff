@@ -40,6 +40,9 @@ pub const PacketInfo = struct {
     length: u32 = 0,
     ip_ttl: u8 = 0,
     tcp_flags: u8 = 0,
+    dns_name: [128]u8 = .{0} ** 128,
+    dns_name_len: u8 = 0,
+    dns_is_response: bool = false,
     raw: [snap_len]u8 = .{0} ** snap_len,
     raw_len: u16 = 0,
 
@@ -51,6 +54,11 @@ pub const PacketInfo = struct {
     /// Destination address as a readable string slice.
     pub fn dstAddr(self: *const PacketInfo) []const u8 {
         return self.dst_addr[0..self.dst_addr_len];
+    }
+
+    /// DNS queried domain name, if this is a DNS packet.
+    pub fn dnsName(self: *const PacketInfo) []const u8 {
+        return self.dns_name[0..self.dns_name_len];
     }
 
     /// Format TCP flags into a human-readable string.
@@ -135,12 +143,56 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
             if (data.len >= 4) {
                 info.src_port = readU16(data, 0);
                 info.dst_port = readU16(data, 2);
+                // DNS runs on port 53 - parse the query name
+                if ((info.src_port == 53 or info.dst_port == 53) and data.len > 20) {
+                    parseDns(data[8..], info);
+                }
             }
         },
         1 => info.protocol = .icmp,
         58 => info.protocol = .icmp6,
         else => info.protocol = .other,
     }
+}
+
+fn parseDns(data: []const u8, info: *PacketInfo) void {
+    // DNS header: 12 bytes minimum
+    // Bytes 0-1: Transaction ID
+    // Bytes 2-3: Flags (bit 15 = QR: 0=query, 1=response)
+    // Bytes 4-5: Question count
+    // Bytes 6-7: Answer count
+    // Byte 12+: Question section (QNAME + QTYPE + QCLASS)
+    if (data.len < 13) return;
+
+    const flags = readU16(data, 2);
+    info.dns_is_response = (flags & 0x8000) != 0;
+    const qcount = readU16(data, 4);
+    if (qcount == 0) return;
+
+    // Decode QNAME: sequence of length-prefixed labels, ending with 0
+    var pos: usize = 12;
+    var out_pos: u8 = 0;
+    while (pos < data.len) {
+        const label_len = data[pos];
+        if (label_len == 0) break;
+        // Pointer compression (top 2 bits set) - stop here
+        if (label_len & 0xC0 == 0xC0) break;
+        pos += 1;
+        if (pos + label_len > data.len) break;
+
+        // Add dot separator between labels
+        if (out_pos > 0 and out_pos < 127) {
+            info.dns_name[out_pos] = '.';
+            out_pos += 1;
+        }
+
+        const copy_len = @min(@as(u8, @intCast(label_len)), 127 - out_pos);
+        if (copy_len == 0) break;
+        @memcpy(info.dns_name[out_pos..][0..copy_len], data[pos..][0..copy_len]);
+        out_pos += copy_len;
+        pos += label_len;
+    }
+    info.dns_name_len = out_pos;
 }
 
 fn parseArp(data: []const u8, info: *PacketInfo) void {
@@ -277,4 +329,54 @@ test "tcp flags formatting" {
     info.tcp_flags = 0x12; // SYN + ACK
     var buf: [40]u8 = undefined;
     try std.testing.expectEqualStrings("SYN,ACK", info.tcpFlagsStr(&buf));
+}
+
+test "parse DNS query extracts domain name" {
+    // Ethernet(14) + IPv4(20, ihl=5, proto=17) + UDP(8, sport=1234 dport=53) + DNS
+    var frame: [80]u8 = .{0} ** 80;
+    // Ethertype IPv4
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    // IPv4 header
+    frame[14] = 0x45; // version 4, ihl 5
+    frame[23] = 17; // UDP
+    frame[26] = 10;
+    frame[27] = 0;
+    frame[28] = 0;
+    frame[29] = 1; // src
+    frame[30] = 8;
+    frame[31] = 8;
+    frame[32] = 8;
+    frame[33] = 8; // dst
+    // UDP header (offset 34)
+    frame[34] = 0x04;
+    frame[35] = 0xD2; // src port 1234
+    frame[36] = 0x00;
+    frame[37] = 0x35; // dst port 53
+    // DNS header (offset 42): txid=0, flags=0 (query), qcount=1
+    frame[46] = 0x00;
+    frame[47] = 0x01; // 1 question
+    // QNAME at offset 54: \x03www\x06google\x03com\x00
+    frame[54] = 3;
+    frame[55] = 'w';
+    frame[56] = 'w';
+    frame[57] = 'w';
+    frame[58] = 6;
+    frame[59] = 'g';
+    frame[60] = 'o';
+    frame[61] = 'o';
+    frame[62] = 'g';
+    frame[63] = 'l';
+    frame[64] = 'e';
+    frame[65] = 3;
+    frame[66] = 'c';
+    frame[67] = 'o';
+    frame[68] = 'm';
+    frame[69] = 0; // end of QNAME
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(Protocol.udp, info.protocol);
+    try std.testing.expectEqual(@as(u16, 53), info.dst_port);
+    try std.testing.expectEqualStrings("www.google.com", info.dnsName());
+    try std.testing.expect(!info.dns_is_response);
 }

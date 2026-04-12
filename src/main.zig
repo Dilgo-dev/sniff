@@ -390,6 +390,8 @@ fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
     }
     // Match against protocol name
     if (containsSubstring(pkt.protocol.name(), term)) return true;
+    // Match against DNS domain name
+    if (pkt.dns_name_len > 0 and containsSubstring(pkt.dnsName(), term)) return true;
     return false;
 }
 
@@ -679,6 +681,11 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             const flags = pkt.tcpFlagsStr(&fbuf);
             r.writeStyledText(d2, 42, "Flags: ", detail_label_style);
             r.writeStyledText(d2, 49, flags, .{ .fg = .{ .rgb = c_peach } });
+        }
+        if (pkt.dns_name_len > 0) {
+            const label = if (pkt.dns_is_response) "DNS resp: " else "DNS: ";
+            r.writeStyledText(d2, 42, label, detail_label_style);
+            r.writeStyledText(d2, 42 + @as(u16, @intCast(label.len)), pkt.dnsName(), .{ .fg = .{ .rgb = c_yellow }, .bold = true });
         }
     }
 }
