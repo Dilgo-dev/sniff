@@ -61,6 +61,11 @@ main() {
 
   chmod +x "$WORKDIR/$BINARY"
 
+  if [ ! -d "$INSTALL_DIR" ]; then
+    echo "creating $INSTALL_DIR (requires sudo)"
+    sudo mkdir -p "$INSTALL_DIR"
+  fi
+
   if [ -w "$INSTALL_DIR" ]; then
     mv "$WORKDIR/$BINARY" "$INSTALL_DIR/$BINARY"
   else
