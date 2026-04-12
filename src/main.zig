@@ -61,8 +61,8 @@ fn init(_: std.mem.Allocator) anyerror!Model {
     return .{ .start_time = std.time.milliTimestamp() };
 }
 
-fn deinit(model: *Model, allocator: std.mem.Allocator) void {
-    model.packets.deinit(allocator);
+fn deinit(model: *Model, _: std.mem.Allocator) void {
+    model.packets.deinit(std.heap.page_allocator);
 }
 
 fn update(model: *Model, m: P.Msg) P.Cmd {
