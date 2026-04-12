@@ -4,6 +4,7 @@
 // displays it in a scrollable TUI powered by glym.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const glym = @import("glym");
 const packet = @import("packet.zig");
 const capture = @import("capture.zig");
@@ -425,9 +426,11 @@ fn writeField(r: *P.Renderer, row: u16, col: u16, width: u16, text: []const u8, 
 }
 
 fn drawHLine(r: *P.Renderer, row: u16, cols: u16) void {
+    // ASCII dash on Windows (CMD lacks box-drawing glyphs), Unicode line elsewhere
+    const ch: u21 = if (builtin.os.tag == .windows) '-' else 0x2500;
     var c: u16 = 0;
     while (c < cols) : (c += 1) {
-        r.applyCell(row, c, 0x2500, sep_style);
+        r.applyCell(row, c, ch, sep_style);
     }
 }
 
