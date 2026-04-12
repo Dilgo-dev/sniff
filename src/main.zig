@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const glym = @import("glym");
 const packet = @import("packet.zig");
 const capture = @import("capture.zig");
+const filter_mod = @import("filter.zig");
 
 const Style = glym.style.Style;
 const Rgb = glym.style.Rgb;
@@ -44,7 +45,12 @@ const Model = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     start_time: i64 = 0,
-    filter_proto: ?packet.Protocol = null,
+    filter: filter_mod.Filter = .{},
+    filter_input: bool = false,
+    filter_buf: [128]u8 = .{0} ** 128,
+    filter_len: u8 = 0,
+    filter_cursor: u8 = 0,
+    filter_error: bool = false,
 };
 
 const max_packets = 50000;
@@ -66,9 +72,13 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
             model.cols = sz.cols;
         },
         .key => |k| {
-            switch (handleKey(model, k)) {
-                .quit => return .quit,
-                else => {},
+            if (model.filter_input) {
+                handleFilterInput(model, k);
+            } else {
+                switch (handleKey(model, k)) {
+                    .quit => return .quit,
+                    else => {},
+                }
             }
         },
         .app => |a| switch (a) {
@@ -136,7 +146,10 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
                     adjustScroll(model);
                 }
             }
-            if (c == 'f') cycleFilter(model);
+            if (c == '/' or c == 'f') {
+                model.filter_input = true;
+                model.filter_error = false;
+            }
             if (c == 'F') model.follow = !model.follow;
         },
         .arrow_up => {
@@ -176,34 +189,79 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
     return .none;
 }
 
-fn cycleFilter(model: *Model) void {
-    model.filter_proto = if (model.filter_proto) |p| switch (p) {
-        .tcp => .udp,
-        .udp => .icmp,
-        .icmp => .arp,
-        else => null,
-    } else .tcp;
-    model.selected = 0;
-    model.scroll = 0;
+fn handleFilterInput(model: *Model, k: glym.input.Key) void {
+    switch (k.code) {
+        .escape => {
+            model.filter_input = false;
+            model.filter_error = false;
+        },
+        .enter => {
+            model.filter_input = false;
+            const expr = model.filter_buf[0..model.filter_len];
+            if (expr.len == 0) {
+                model.filter = .{};
+                model.filter_error = false;
+            } else if (filter_mod.parse(expr)) |f| {
+                model.filter = f;
+                model.filter_error = false;
+            } else {
+                model.filter_error = true;
+            }
+            model.selected = 0;
+            model.scroll = 0;
+        },
+        .backspace => {
+            if (model.filter_cursor > 0) {
+                model.filter_cursor -= 1;
+                // Shift remaining chars left
+                var i: usize = model.filter_cursor;
+                while (i + 1 < model.filter_len) : (i += 1) {
+                    model.filter_buf[i] = model.filter_buf[i + 1];
+                }
+                model.filter_len -= 1;
+                model.filter_error = false;
+            }
+        },
+        .char => |c| {
+            if (c > 0 and c < 128 and model.filter_len < 127) {
+                // Shift chars right to make room
+                var i: usize = model.filter_len;
+                while (i > model.filter_cursor) : (i -= 1) {
+                    model.filter_buf[i] = model.filter_buf[i - 1];
+                }
+                model.filter_buf[model.filter_cursor] = @intCast(c);
+                model.filter_cursor += 1;
+                model.filter_len += 1;
+                model.filter_error = false;
+            }
+        },
+        .arrow_left => {
+            if (model.filter_cursor > 0) model.filter_cursor -= 1;
+        },
+        .arrow_right => {
+            if (model.filter_cursor < model.filter_len) model.filter_cursor += 1;
+        },
+        else => {},
+    }
 }
 
 fn visibleCount(model: *const Model) usize {
-    if (model.filter_proto == null) return model.packets.items.len;
+    if (!model.filter.active) return model.packets.items.len;
     var n: usize = 0;
-    for (model.packets.items) |p| {
-        if (p.protocol == model.filter_proto.?) n += 1;
+    for (model.packets.items) |*p| {
+        if (model.filter.matches(p)) n += 1;
     }
     return n;
 }
 
 fn getVisible(model: *const Model, idx: usize) ?packet.PacketInfo {
-    if (model.filter_proto == null) {
+    if (!model.filter.active) {
         return if (idx < model.packets.items.len) model.packets.items[idx] else null;
     }
     var n: usize = 0;
-    for (model.packets.items) |p| {
-        if (p.protocol == model.filter_proto.?) {
-            if (n == idx) return p;
+    for (model.packets.items) |*p| {
+        if (model.filter.matches(p)) {
+            if (n == idx) return p.*;
             n += 1;
         }
     }
@@ -281,10 +339,9 @@ fn view(model: *Model, r: *P.Renderer) void {
     } else if (model.follow) {
         r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
     }
-    if (model.filter_proto) |fp| {
-        var fbuf: [16]u8 = undefined;
-        const fs = std.fmt.bufPrint(&fbuf, "[{s}]", .{fp.name()}) catch "";
-        r.writeStyledText(0, cols / 2, fs, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_peach }, .bold = true });
+    if (model.filter.active) {
+        const expr = model.filter_buf[0..model.filter_len];
+        r.writeStyledText(0, cols / 2 -| @as(u16, @intCast(expr.len / 2)), expr, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_peach }, .bold = true });
     }
 
     // Column headers
@@ -376,16 +433,31 @@ fn view(model: *Model, r: *P.Renderer) void {
         }
     }
 
-    // Help bar
+    // Help bar / filter input
     const help_row: u16 = rows - 1;
     r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
-    var col: u16 = 1;
-    col = writeHelpKey(r, help_row, col, "q", "quit");
-    col = writeHelpKey(r, help_row, col, "p", "pause");
-    col = writeHelpKey(r, help_row, col, "f", "filter");
-    col = writeHelpKey(r, help_row, col, "F", "follow");
-    col = writeHelpKey(r, help_row, col, "g/G", "top/bottom");
-    _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
+    if (model.filter_input) {
+        const prompt_style: Style = if (model.filter_error)
+            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true }
+        else
+            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true };
+        r.writeStyledText(help_row, 1, "filter: ", prompt_style);
+        const expr = model.filter_buf[0..model.filter_len];
+        r.writeStyledText(help_row, 9, expr, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
+        // Cursor
+        const cursor_col: u16 = 9 + @as(u16, model.filter_cursor);
+        r.applyCell(help_row, cursor_col, if (model.filter_cursor < model.filter_len) model.filter_buf[model.filter_cursor] else ' ', .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
+        // Hint
+        r.writeStyledText(help_row, cols -| 20, "enter:apply esc:cancel", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+    } else {
+        var col: u16 = 1;
+        col = writeHelpKey(r, help_row, col, "q", "quit");
+        col = writeHelpKey(r, help_row, col, "p", "pause");
+        col = writeHelpKey(r, help_row, col, "/", "filter");
+        col = writeHelpKey(r, help_row, col, "F", "follow");
+        col = writeHelpKey(r, help_row, col, "g/G", "top/bottom");
+        _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
+    }
 }
 
 fn writeHelpKey(r: *P.Renderer, row: u16, col: u16, key: []const u8, desc: []const u8) u16 {

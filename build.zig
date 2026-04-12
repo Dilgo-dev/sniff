@@ -28,13 +28,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the packet sniffer");
     run_step.dependOn(&run.step);
 
-    const test_mod = b.createModule(.{
+    const test_step = b.step("test", "Run unit tests");
+
+    const pkt_test_mod = b.createModule(.{
         .root_source_file = b.path("src/packet.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const tests = b.addTest(.{ .root_module = test_mod });
-    const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
+    const pkt_tests = b.addTest(.{ .root_module = pkt_test_mod });
+    test_step.dependOn(&b.addRunArtifact(pkt_tests).step);
+
+    const filter_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/filter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const filter_tests = b.addTest(.{ .root_module = filter_test_mod });
+    test_step.dependOn(&b.addRunArtifact(filter_tests).step);
 }
