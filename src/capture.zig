@@ -1,7 +1,7 @@
 // Cross-platform packet capture.
 //
-// Linux: AF_PACKET raw socket (captures all interfaces).
-// macOS: BPF device (/dev/bpfN, bound to en0 by default).
+// Linux: AF_PACKET raw socket (all interfaces, or bind to one).
+// macOS: BPF device (/dev/bpfN, bound to a named interface).
 // Windows: raw socket with SIO_RCVALL (no extra install needed).
 
 const std = @import("std");
@@ -21,19 +21,40 @@ pub const CaptureError = error{
     ReadFailed,
 };
 
-/// Open a capture device on the current platform.
-pub fn open() CaptureError!CaptureHandle {
+/// Fixed-size interface name (max 15 chars + NUL, like IFNAMSIZ).
+pub const IfName = struct {
+    buf: [16]u8 = .{0} ** 16,
+    len: u8 = 0,
+
+    pub fn slice(self: *const IfName) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub const max_interfaces = 32;
+
+/// List available network interfaces. Returns the count written to out.
+pub fn listInterfaces(out: []IfName) usize {
     switch (builtin.os.tag) {
-        .linux => return openLinux(),
-        .macos => return openBpf(),
-        .windows => return openWin(),
+        .linux => return listLinuxIfaces(out),
+        .macos => return listMacIfaces(out),
+        .windows => return listWinIfaces(out),
+        else => return 0,
+    }
+}
+
+/// Open a capture device, optionally bound to a specific interface.
+/// Pass null to capture on all interfaces (Linux) or the default (macOS/Win).
+pub fn openOn(iface: ?[]const u8) CaptureError!CaptureHandle {
+    switch (builtin.os.tag) {
+        .linux => return openLinuxOn(iface),
+        .macos => return openBpfOn(iface),
+        .windows => return openWinOn(iface),
         else => comptime unreachable,
     }
 }
 
 /// Read one Ethernet frame into buf and return the valid slice.
-/// On Linux/macOS: blocks until a packet arrives.
-/// On Windows: non-blocking, returns ReadFailed when no data.
 pub fn readOne(handle: CaptureHandle, buf: []u8) CaptureError![]const u8 {
     switch (builtin.os.tag) {
         .linux => return readLinux(handle, buf),
@@ -75,6 +96,8 @@ const linux = if (builtin.os.tag == .linux) struct {
     const AF_PACKET: u32 = 17;
     const SOCK_RAW: u32 = 3;
     const ETH_P_ALL: u16 = 0x0003;
+    const SOL_SOCKET: u32 = 1;
+    const SO_BINDTODEVICE: u32 = 25;
 
     fn openSocket() CaptureError!std.posix.fd_t {
         const rc = std.os.linux.socket(AF_PACKET, SOCK_RAW, std.mem.nativeToBig(u16, ETH_P_ALL));
@@ -89,6 +112,15 @@ const linux = if (builtin.os.tag == .linux) struct {
         return @intCast(rc);
     }
 
+    fn bindDevice(fd: std.posix.fd_t, iface: []const u8) CaptureError!void {
+        var name: [16]u8 = .{0} ** 16;
+        const len = @min(iface.len, 15);
+        @memcpy(name[0..len], iface[0..len]);
+        const rc = std.os.linux.setsockopt(@intCast(fd), SOL_SOCKET, SO_BINDTODEVICE, &name, 16);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) return error.OpenFailed;
+    }
+
     fn read(fd: std.posix.fd_t, buf: []u8) CaptureError![]const u8 {
         const n = std.posix.read(fd, buf) catch return error.ReadFailed;
         if (n < 14) return error.ReadFailed;
@@ -96,12 +128,36 @@ const linux = if (builtin.os.tag == .linux) struct {
     }
 } else struct {};
 
-fn openLinux() CaptureError!CaptureHandle {
-    return linux.openSocket();
+fn openLinuxOn(iface: ?[]const u8) CaptureError!CaptureHandle {
+    const fd = try linux.openSocket();
+    if (iface) |name| {
+        linux.bindDevice(fd, name) catch {
+            std.posix.close(fd);
+            return error.OpenFailed;
+        };
+    }
+    return fd;
 }
 
 fn readLinux(handle: CaptureHandle, buf: []u8) CaptureError![]const u8 {
     return linux.read(handle, buf);
+}
+
+fn listLinuxIfaces(out: []IfName) usize {
+    var dir = std.fs.openDirAbsolute("/sys/class/net", .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var iter = dir.iterate();
+    var count: usize = 0;
+    while (count < out.len) {
+        const entry = (iter.next() catch null) orelse break;
+        if (entry.name.len == 0 or entry.name.len > 15) continue;
+        var ifn: IfName = .{};
+        @memcpy(ifn.buf[0..entry.name.len], entry.name);
+        ifn.len = @intCast(entry.name.len);
+        out[count] = ifn;
+        count += 1;
+    }
+    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +189,22 @@ const bpf = if (builtin.os.tag == .macos) struct {
         ifr_data: [16]u8,
     };
 
+    const Ifaddrs = extern struct {
+        ifa_next: ?*Ifaddrs,
+        ifa_name: [*:0]const u8,
+        ifa_flags: c_uint,
+        ifa_addr: ?*anyopaque,
+        ifa_netmask: ?*anyopaque,
+        ifa_broadaddr: ?*anyopaque,
+        ifa_data: ?*anyopaque,
+    };
+
+    extern "c" fn getifaddrs(ifap: *?*Ifaddrs) c_int;
+    extern "c" fn freeifaddrs(ifa: *Ifaddrs) void;
+
+    const IFF_UP: c_uint = 0x1;
+    const IFF_LOOPBACK: c_uint = 0x8;
+
     fn openDevice() CaptureError!std.posix.fd_t {
         var path_buf: [16]u8 = undefined;
         var i: u32 = 0;
@@ -153,13 +225,13 @@ const bpf = if (builtin.os.tag == .macos) struct {
         return error.NoDevice;
     }
 
-    fn configure(fd: std.posix.fd_t) CaptureError!void {
+    fn configureOn(fd: std.posix.fd_t, iface: []const u8) CaptureError!void {
         var buf_len: u32 = BPF_BUF_SIZE;
         _ = ioctl(fd, BIOCSBLEN, @intFromPtr(&buf_len)) catch return error.OpenFailed;
 
         var ifr: Ifreq = std.mem.zeroes(Ifreq);
-        const iface = "en0";
-        @memcpy(ifr.ifr_name[0..iface.len], iface);
+        const len = @min(iface.len, 15);
+        @memcpy(ifr.ifr_name[0..len], iface[0..len]);
         _ = ioctl(fd, BIOCSETIF, @intFromPtr(&ifr)) catch return error.OpenFailed;
 
         var imm: u32 = 1;
@@ -204,11 +276,55 @@ const bpf = if (builtin.os.tag == .macos) struct {
 
         return out[0..copy_len];
     }
+
+    fn listIfaces(out: []IfName) usize {
+        var ifap: ?*Ifaddrs = null;
+        if (getifaddrs(&ifap) != 0) return 0;
+        defer if (ifap) |p| freeifaddrs(p);
+
+        var count: usize = 0;
+        var cur = ifap;
+        while (cur) |ifa| : (cur = ifa.ifa_next) {
+            if (count >= out.len) break;
+            // Skip down or loopback interfaces
+            if (ifa.ifa_flags & IFF_UP == 0) continue;
+            if (ifa.ifa_flags & IFF_LOOPBACK != 0) continue;
+
+            const name = std.mem.span(ifa.ifa_name);
+            if (name.len == 0 or name.len > 15) continue;
+
+            // Deduplicate (getifaddrs returns one entry per address)
+            var dup = false;
+            for (out[0..count]) |existing| {
+                if (std.mem.eql(u8, existing.slice(), name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+
+            var ifn: IfName = .{};
+            @memcpy(ifn.buf[0..name.len], name);
+            ifn.len = @intCast(name.len);
+            out[count] = ifn;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Pick the first non-loopback, up interface as default.
+    fn defaultIface() []const u8 {
+        var buf: [1]IfName = undefined;
+        const n = listIfaces(&buf);
+        if (n > 0) return buf[0].slice();
+        return "en0";
+    }
 } else struct {};
 
-fn openBpf() CaptureError!CaptureHandle {
+fn openBpfOn(iface: ?[]const u8) CaptureError!CaptureHandle {
     const fd = try bpf.openDevice();
-    bpf.configure(fd) catch |err| {
+    const name = iface orelse bpf.defaultIface();
+    bpf.configureOn(fd, name) catch |err| {
         std.posix.close(fd);
         return err;
     };
@@ -219,14 +335,13 @@ fn readBpf(handle: CaptureHandle, buf: []u8) CaptureError![]const u8 {
     return bpf.readPacket(handle, buf);
 }
 
+fn listMacIfaces(out: []IfName) usize {
+    return bpf.listIfaces(out);
+}
+
 // ---------------------------------------------------------------------------
 // Windows: raw socket with SIO_RCVALL (zero dependencies)
 // ---------------------------------------------------------------------------
-//
-// Captures all IP traffic on the primary network interface using a raw
-// socket in non-blocking mode. Packets arrive without Ethernet headers,
-// so readOne prepends a synthetic 14-byte header to keep the parser
-// uniform across platforms. ARP is not visible through this method.
 
 const win = if (builtin.os.tag == .windows) struct {
     const SOCKET = usize;
@@ -238,7 +353,7 @@ const win = if (builtin.os.tag == .windows) struct {
     const WSADATA = extern struct { data: [512]u8 };
 
     const sockaddr_in = extern struct {
-        family: u16 = 2, // AF_INET
+        family: u16 = 2,
         port: u16 = 0,
         addr: u32 = 0,
         zero: [8]u8 = .{0} ** 8,
@@ -256,11 +371,12 @@ const win = if (builtin.os.tag == .windows) struct {
     extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
     extern "ws2_32" fn socket(af: c_int, sock_type: c_int, protocol: c_int) callconv(.winapi) SOCKET;
     extern "ws2_32" fn bind(s: SOCKET, addr: *const sockaddr_in, len: c_int) callconv(.winapi) c_int;
-    extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn recv(s: SOCKET, buf_ptr: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
     extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, argp: *u32) callconv(.winapi) c_int;
     extern "ws2_32" fn gethostname(name: [*]u8, len: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn gethostbyname(name: [*:0]const u8) callconv(.winapi) ?*Hostent;
+    extern "ws2_32" fn inet_ntoa(addr: u32) callconv(.winapi) ?[*:0]const u8;
 
     extern "ws2_32" fn WSAIoctl(
         s: SOCKET,
@@ -274,29 +390,75 @@ const win = if (builtin.os.tag == .windows) struct {
         completion: ?*anyopaque,
     ) callconv(.winapi) c_int;
 
-    fn openDevice() CaptureError!SOCKET {
+    fn initWsa() bool {
         var wsa: WSADATA = undefined;
-        if (WSAStartup(0x0202, &wsa) != 0) return error.OpenFailed;
+        return WSAStartup(0x0202, &wsa) == 0;
+    }
 
-        // SOCK_RAW(3) + IPPROTO_IP(0)
+    fn resolveHost() ?*Hostent {
+        var hostname: [256]u8 = .{0} ** 256;
+        if (gethostname(&hostname, 256) != 0) return null;
+        return gethostbyname(@ptrCast(&hostname));
+    }
+
+    /// Parse a dotted-decimal IPv4 string into a network-order u32.
+    fn parseIp(s: []const u8) ?u32 {
+        var octets: [4]u8 = undefined;
+        var idx: usize = 0;
+        var start: usize = 0;
+        for (s, 0..) |c, i| {
+            if (c == '.' or i == s.len - 1) {
+                const end = if (c == '.') i else i + 1;
+                const val = std.fmt.parseInt(u8, s[start..end], 10) catch return null;
+                if (idx >= 4) return null;
+                octets[idx] = val;
+                idx += 1;
+                start = i + 1;
+            }
+        }
+        if (idx != 4) return null;
+        return @as(u32, octets[0]) | (@as(u32, octets[1]) << 8) | (@as(u32, octets[2]) << 16) | (@as(u32, octets[3]) << 24);
+    }
+
+    fn openDeviceOn(iface: ?[]const u8) CaptureError!SOCKET {
+        if (!initWsa()) return error.OpenFailed;
+
         const s = socket(2, 3, 0);
         if (s == INVALID_SOCKET) return error.PermissionDenied;
 
-        // Resolve local IP for binding
-        var hostname: [256]u8 = .{0} ** 256;
-        if (gethostname(&hostname, 256) != 0) {
-            _ = closesocket(s);
-            return error.NoDevice;
-        }
-        const host = gethostbyname(@ptrCast(&hostname)) orelse {
-            _ = closesocket(s);
-            return error.NoDevice;
+        // Determine which IP to bind to
+        const ip: u32 = blk: {
+            if (iface) |name| {
+                // Try parsing as IP address directly
+                if (parseIp(name)) |addr| break :blk addr;
+                // Try matching by adapter index (nth address)
+                const idx = std.fmt.parseInt(usize, name, 10) catch {
+                    _ = closesocket(s);
+                    return error.NoDevice;
+                };
+                const host = resolveHost() orelse {
+                    _ = closesocket(s);
+                    return error.NoDevice;
+                };
+                var i: usize = 0;
+                while (host.h_addr_list[i]) |addr_ptr| : (i += 1) {
+                    if (i == idx) break :blk @as(*align(1) const u32, @ptrCast(addr_ptr)).*;
+                }
+                _ = closesocket(s);
+                return error.NoDevice;
+            } else {
+                // Default: first address
+                const host = resolveHost() orelse {
+                    _ = closesocket(s);
+                    return error.NoDevice;
+                };
+                const addr_ptr = host.h_addr_list[0] orelse {
+                    _ = closesocket(s);
+                    return error.NoDevice;
+                };
+                break :blk @as(*align(1) const u32, @ptrCast(addr_ptr)).*;
+            }
         };
-        const addr_ptr = host.h_addr_list[0] orelse {
-            _ = closesocket(s);
-            return error.NoDevice;
-        };
-        const ip: u32 = @as(*align(1) const u32, @ptrCast(addr_ptr)).*;
 
         var bind_addr: sockaddr_in = .{ .addr = ip };
         if (bind(s, &bind_addr, @sizeOf(sockaddr_in)) != 0) {
@@ -304,7 +466,6 @@ const win = if (builtin.os.tag == .windows) struct {
             return error.OpenFailed;
         }
 
-        // Enable promiscuous receive-all mode
         var rcvall: u32 = RCVALL_ON;
         var bytes_ret: u32 = 0;
         if (WSAIoctl(s, SIO_RCVALL, &rcvall, @sizeOf(u32), null, 0, &bytes_ret, null, null) != 0) {
@@ -312,7 +473,6 @@ const win = if (builtin.os.tag == .windows) struct {
             return error.PermissionDenied;
         }
 
-        // Non-blocking so inline async_task returns immediately when idle
         var mode: u32 = 1;
         _ = ioctlsocket(s, FIONBIO, &mode);
 
@@ -320,13 +480,11 @@ const win = if (builtin.os.tag == .windows) struct {
     }
 
     fn readPacket(s: SOCKET, buf: []u8) CaptureError![]const u8 {
-        if (buf.len < 34) return error.ReadFailed; // 14 eth + 20 ip min
+        if (buf.len < 34) return error.ReadFailed;
 
-        // Receive raw IP into buf[14..], leaving room for Ethernet header
         const n = recv(s, @ptrCast(buf.ptr + 14), @intCast(buf.len - 14), 0);
         if (n <= 0) return error.ReadFailed;
 
-        // Prepend synthetic Ethernet header (zeroed MACs + correct EtherType)
         @memset(buf[0..12], 0);
         const version = buf[14] >> 4;
         if (version == 4) {
@@ -346,10 +504,33 @@ const win = if (builtin.os.tag == .windows) struct {
         _ = closesocket(s);
         _ = WSACleanup();
     }
+
+    fn listIfaces(out: []IfName) usize {
+        if (!initWsa()) return 0;
+        defer _ = WSACleanup();
+        const host = resolveHost() orelse return 0;
+
+        var count: usize = 0;
+        var i: usize = 0;
+        while (count < out.len) : (i += 1) {
+            const addr_ptr = host.h_addr_list[i] orelse break;
+            const ip: u32 = @as(*align(1) const u32, @ptrCast(addr_ptr)).*;
+            const a: u8 = @truncate(ip);
+            const b: u8 = @truncate(ip >> 8);
+            const c: u8 = @truncate(ip >> 16);
+            const d: u8 = @truncate(ip >> 24);
+            var ifn: IfName = .{};
+            const s = std.fmt.bufPrint(&ifn.buf, "{d}.{d}.{d}.{d}", .{ a, b, c, d }) catch continue;
+            ifn.len = @intCast(s.len);
+            out[count] = ifn;
+            count += 1;
+        }
+        return count;
+    }
 } else struct {};
 
-fn openWin() CaptureError!CaptureHandle {
-    return win.openDevice();
+fn openWinOn(iface: ?[]const u8) CaptureError!CaptureHandle {
+    return win.openDeviceOn(iface);
 }
 
 fn readWin(handle: CaptureHandle, buf: []u8) CaptureError![]const u8 {
@@ -358,4 +539,8 @@ fn readWin(handle: CaptureHandle, buf: []u8) CaptureError![]const u8 {
 
 fn closeWin(handle: CaptureHandle) void {
     win.closeDevice(handle);
+}
+
+fn listWinIfaces(out: []IfName) usize {
+    return win.listIfaces(out);
 }

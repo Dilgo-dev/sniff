@@ -256,8 +256,9 @@ fn view(model: *Model, r: *P.Renderer) void {
     r.fillRect(0, 0, 1, cols, .{ .char = ' ', .style = title_style });
     r.writeStyledText(0, 1, "sniff", title_style);
     {
-        var buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, " {d} packets", .{model.packets.items.len}) catch "";
+        var buf: [80]u8 = undefined;
+        const iface = activeIfaceSlice();
+        const s = std.fmt.bufPrint(&buf, " [{s}] {d} packets", .{ iface, model.packets.items.len }) catch "";
         r.writeStyledText(0, 7, s, title_style);
     }
     if (model.paused) {
@@ -449,8 +450,79 @@ fn fmtTime(timestamp_ms: i64, buf: *[12]u8) []const u8 {
 
 // -- Entry point --
 
+var active_iface: [32]u8 = .{0} ** 32;
+var active_iface_len: u8 = 0;
+
+fn activeIfaceSlice() []const u8 {
+    return active_iface[0..active_iface_len];
+}
+
 pub fn main() !void {
-    capture_handle = capture.open() catch |err| {
+    // Parse CLI arguments
+    var iface_arg: ?[]const u8 = null;
+    var list_mode = false;
+
+    const argv = std.os.argv;
+    var ai: usize = 1;
+    while (ai < argv.len) : (ai += 1) {
+        const arg = std.mem.span(argv[ai]);
+        if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
+            list_mode = true;
+        } else if (std.mem.eql(u8, arg, "-i")) {
+            ai += 1;
+            if (ai < argv.len) {
+                iface_arg = std.mem.span(argv[ai]);
+            }
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            std.debug.print(
+                \\sniff - terminal packet sniffer
+                \\
+                \\Usage: sniff [options]
+                \\
+                \\Options:
+                \\  -l, --list    List available network interfaces
+                \\  -i <iface>    Capture on a specific interface
+                \\  -h, --help    Show this help
+                \\
+                \\Without -i, captures on all interfaces (Linux) or default (macOS/Windows).
+                \\Requires root/sudo (Linux, macOS) or Administrator (Windows).
+                \\
+            , .{});
+            return;
+        }
+    }
+
+    // List mode
+    if (list_mode) {
+        var ifaces: [capture.max_interfaces]capture.IfName = undefined;
+        const count = capture.listInterfaces(&ifaces);
+        if (count == 0) {
+            std.debug.print("No interfaces found.\n", .{});
+        } else {
+            std.debug.print("Available interfaces:\n", .{});
+            for (ifaces[0..count], 0..) |iface, idx| {
+                std.debug.print("  {d}: {s}\n", .{ idx, iface.slice() });
+            }
+            std.debug.print("\nUse: sniff -i <name>\n", .{});
+        }
+        return;
+    }
+
+    // Store active interface name for display
+    if (iface_arg) |name| {
+        const len = @min(name.len, active_iface.len);
+        @memcpy(active_iface[0..len], name[0..len]);
+        active_iface_len = @intCast(len);
+    } else {
+        const label = switch (builtin.os.tag) {
+            .linux => "all",
+            else => "default",
+        };
+        @memcpy(active_iface[0..label.len], label);
+        active_iface_len = @intCast(label.len);
+    }
+
+    capture_handle = capture.openOn(iface_arg) catch |err| {
         std.debug.print("sniff: {s}\n", .{capture.errorMessage(err)});
         std.process.exit(1);
     };
