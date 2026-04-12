@@ -310,9 +310,17 @@ const bpf = if (builtin.os.tag == .macos) struct {
 
     var default_iface_buf: IfName = .{};
 
+    // Prefer en0 (WiFi) on macOS since getifaddrs often returns
+    // virtual interfaces (utun, awdl, bridge) first.
     fn defaultIface() []const u8 {
-        var buf: [1]IfName = undefined;
+        var buf: [max_interfaces]IfName = undefined;
         const n = listIfaces(&buf);
+        for (buf[0..n]) |*ifn| {
+            if (ifn.len >= 3 and std.mem.eql(u8, ifn.buf[0..3], "en0")) {
+                default_iface_buf = ifn.*;
+                return default_iface_buf.buf[0..default_iface_buf.len];
+            }
+        }
         if (n > 0) {
             default_iface_buf = buf[0];
             return default_iface_buf.buf[0..default_iface_buf.len];
