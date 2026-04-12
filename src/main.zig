@@ -56,6 +56,7 @@ const Model = struct {
     search_active: bool = false,
     hex_view: bool = false,
     hex_scroll: usize = 0,
+    stats_view: bool = false,
     input_mode: InputMode = .none,
     input_buf: [128]u8 = .{0} ** 128,
     input_len: u8 = 0,
@@ -156,9 +157,14 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 'f') openInput(model, .filter);
             if (c == '/') openInput(model, .search);
             if (c == 'w') openInput(model, .save);
+            if (c == 's') {
+                model.stats_view = !model.stats_view;
+                model.hex_view = false;
+            }
             if (c == 'x') {
                 model.hex_view = !model.hex_view;
                 model.hex_scroll = 0;
+                model.stats_view = false;
             }
             if (c == 'n') searchNext(model, true);
             if (c == 'N') searchNext(model, false);
@@ -521,7 +527,9 @@ fn view(model: *Model, r: *P.Renderer) void {
         }
     }
 
-    if (model.hex_view) {
+    if (model.stats_view) {
+        viewStats(model, r, rows, cols);
+    } else if (model.hex_view) {
         viewHexDump(model, r, rows, cols);
     } else {
         viewPacketList(model, r, rows, cols);
@@ -559,6 +567,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "/", "search");
         col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
         col = writeHelpKey(r, help_row, col, "x", "hex");
+        col = writeHelpKey(r, help_row, col, "s", "stats");
         col = writeHelpKey(r, help_row, col, "w", "export");
         col = writeHelpKey(r, help_row, col, "F", "follow");
         _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
@@ -658,6 +667,173 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         } else if (pkt.http_info_len > 0) {
             r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = c_peach }, .bold = true });
         }
+    }
+}
+
+fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const pkts = model.packets.items;
+    if (pkts.len == 0) {
+        r.writeStyledText(2, 1, "No packets captured yet", detail_label_style);
+        return;
+    }
+
+    // Protocol stats
+    var proto_bytes: [6]u64 = .{0} ** 6;
+    var proto_count: [6]u32 = .{0} ** 6;
+    const proto_names = [_][]const u8{ "TCP", "UDP", "ICMP", "ICMPv6", "ARP", "OTHER" };
+    const proto_colors = [_]Rgb{ c_green, c_blue, c_yellow, c_yellow, c_mauve, subtext0 };
+
+    // Top IPs by bytes
+    const max_top = 10;
+    var top_ips: [max_top]IpEntry = undefined;
+    for (&top_ips) |*e| e.* = .{};
+    var total_bytes: u64 = 0;
+
+    for (pkts) |*pkt| {
+        const len: u64 = pkt.length;
+        total_bytes += len;
+
+        const pi: usize = switch (pkt.protocol) {
+            .tcp => 0,
+            .udp => 1,
+            .icmp => 2,
+            .icmp6 => 3,
+            .arp => 4,
+            .other => 5,
+        };
+        proto_bytes[pi] += len;
+        proto_count[pi] += 1;
+
+        // Track top source IPs
+        if (pkt.src_addr_len > 0) {
+            insertTopIp(&top_ips, pkt.src_addr, pkt.src_addr_len, len);
+        }
+    }
+
+    var row: u16 = 1;
+    r.writeStyledText(row, 1, "Protocol Breakdown", .{ .fg = .{ .rgb = text_col }, .bold = true });
+    row += 1;
+    drawHLine(r, row, cols);
+    row += 1;
+
+    // Bar chart per protocol
+    const bar_max: u16 = if (cols > 60) cols - 40 else 20;
+    for (0..6) |pi| {
+        if (proto_count[pi] == 0) continue;
+        if (row >= rows -| 2) break;
+
+        r.writeStyledText(row, 1, proto_names[pi], .{ .fg = .{ .rgb = proto_colors[pi] }, .bold = true });
+
+        var cbuf: [16]u8 = undefined;
+        const cs = std.fmt.bufPrint(&cbuf, "{d}", .{proto_count[pi]}) catch "";
+        r.writeStyledText(row, 10, cs, .{ .fg = .{ .rgb = subtext0 } });
+
+        var bbuf: [16]u8 = undefined;
+        const bs = fmtBytes(proto_bytes[pi], &bbuf);
+        r.writeStyledText(row, 20, bs, .{ .fg = .{ .rgb = text_col } });
+
+        // Bar
+        const ratio: u16 = if (total_bytes > 0) @intCast(@min(@as(u64, bar_max), proto_bytes[pi] * bar_max / total_bytes)) else 0;
+        var bc: u16 = 0;
+        while (bc < ratio) : (bc += 1) {
+            r.applyCell(row, 30 + bc, 0x2588, .{ .fg = .{ .rgb = proto_colors[pi] } });
+        }
+
+        row += 1;
+    }
+
+    row += 1;
+    if (row < rows -| 2) {
+        r.writeStyledText(row, 1, "Top Source IPs", .{ .fg = .{ .rgb = text_col }, .bold = true });
+        row += 1;
+        drawHLine(r, row, cols);
+        row += 1;
+
+        for (&top_ips) |*entry| {
+            if (entry.bytes == 0) break;
+            if (row >= rows -| 2) break;
+
+            const addr = entry.addr[0..entry.len];
+            r.writeStyledText(row, 1, addr, .{ .fg = .{ .rgb = c_blue }, .bold = true });
+
+            var bbuf2: [16]u8 = undefined;
+            const bs2 = fmtBytes(entry.bytes, &bbuf2);
+            r.writeStyledText(row, 20, bs2, .{ .fg = .{ .rgb = text_col } });
+
+            const pct = if (total_bytes > 0) entry.bytes * 100 / total_bytes else 0;
+            var pbuf: [8]u8 = undefined;
+            const ps = std.fmt.bufPrint(&pbuf, "{d}%", .{pct}) catch "";
+            r.writeStyledText(row, 32, ps, .{ .fg = .{ .rgb = subtext0 } });
+
+            const ratio: u16 = if (total_bytes > 0) @intCast(@min(@as(u64, bar_max), entry.bytes * bar_max / total_bytes)) else 0;
+            var bc: u16 = 0;
+            while (bc < ratio) : (bc += 1) {
+                r.applyCell(row, 38 + bc, 0x2588, .{ .fg = .{ .rgb = c_blue } });
+            }
+
+            row += 1;
+        }
+    }
+
+    // Total
+    if (row + 1 < rows -| 1) {
+        row += 1;
+        var tbuf: [32]u8 = undefined;
+        var bbuf3: [16]u8 = undefined;
+        const total_s = fmtBytes(total_bytes, &bbuf3);
+        const ts = std.fmt.bufPrint(&tbuf, "Total: {d} packets  {s}", .{ pkts.len, total_s }) catch "";
+        r.writeStyledText(row, 1, ts, .{ .fg = .{ .rgb = text_col }, .bold = true });
+    }
+}
+
+const IpEntry = struct {
+    addr: [46]u8 = .{0} ** 46,
+    len: u8 = 0,
+    bytes: u64 = 0,
+};
+
+fn insertTopIp(top: []IpEntry, addr: [46]u8, addr_len: u8, bytes: u64) void {
+    // Find existing or insert
+    for (top) |*entry| {
+        if (entry.len == addr_len and std.mem.eql(u8, entry.addr[0..entry.len], addr[0..addr_len])) {
+            entry.bytes += bytes;
+            // Bubble up if needed
+            sortTopIps(top);
+            return;
+        }
+    }
+    // Insert if larger than smallest
+    const last = &top[top.len - 1];
+    if (bytes > last.bytes or last.len == 0) {
+        last.addr = addr;
+        last.len = addr_len;
+        last.bytes = bytes;
+        sortTopIps(top);
+    }
+}
+
+fn sortTopIps(top: []IpEntry) void {
+    // Simple insertion sort descending by bytes
+    var i: usize = 1;
+    while (i < top.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and top[j].bytes > top[j - 1].bytes) : (j -= 1) {
+            const tmp = top[j];
+            top[j] = top[j - 1];
+            top[j - 1] = tmp;
+        }
+    }
+}
+
+fn fmtBytes(bytes: u64, buf: *[16]u8) []const u8 {
+    if (bytes >= 1024 * 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d}.{d} GB", .{ bytes / (1024 * 1024 * 1024), (bytes / (1024 * 1024 * 100)) % 10 }) catch "";
+    } else if (bytes >= 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d}.{d} MB", .{ bytes / (1024 * 1024), (bytes / (1024 * 100)) % 10 }) catch "";
+    } else if (bytes >= 1024) {
+        return std.fmt.bufPrint(buf, "{d}.{d} KB", .{ bytes / 1024, (bytes / 100) % 10 }) catch "";
+    } else {
+        return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
     }
 }
 
