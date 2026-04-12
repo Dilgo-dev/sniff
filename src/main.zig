@@ -1,25 +1,26 @@
 // sniff - terminal packet sniffer.
 //
-// Captures network traffic via Linux raw sockets (AF_PACKET) and
+// Captures network traffic via platform-specific raw capture and
 // displays it in a scrollable TUI powered by glym.
 
 const std = @import("std");
 const glym = @import("glym");
 const packet = @import("packet.zig");
+const capture = @import("capture.zig");
 
 const Style = glym.style.Style;
 const Rgb = glym.style.Rgb;
 
 // -- Capture state (module-level for async_task compatibility) --
 
-var capture_fd: std.posix.fd_t = -1;
+var capture_handle: ?capture.CaptureHandle = null;
 
 fn captureOne(_: std.mem.Allocator) anyerror!?App {
-    if (capture_fd < 0) return null;
+    const handle = capture_handle orelse return null;
     var buf: [65536]u8 = undefined;
-    const n = std.posix.read(capture_fd, &buf) catch return null;
-    if (n < 14) return null;
-    var info = packet.parse(buf[0..n]) orelse return null;
+    const frame = capture.readOne(handle, &buf) catch return null;
+    if (frame.len < 14) return null;
+    var info = packet.parse(frame) orelse return null;
     info.timestamp_ms = std.time.milliTimestamp();
     return .{ .captured = info };
 }
@@ -446,18 +447,11 @@ fn fmtTime(timestamp_ms: i64, buf: *[12]u8) []const u8 {
 // -- Entry point --
 
 pub fn main() !void {
-    const rc = std.os.linux.socket(17, 3, std.mem.nativeToBig(u16, 0x0003));
-    const signed: isize = @bitCast(rc);
-    if (signed < 0) {
-        const err_str = switch (@as(std.posix.E, @enumFromInt(-signed))) {
-            .PERM, .ACCES => "Permission denied. Run with sudo or set CAP_NET_RAW.",
-            else => "Failed to open raw socket.",
-        };
-        std.debug.print("sniff: {s}\n", .{err_str});
+    capture_handle = capture.open() catch |err| {
+        std.debug.print("sniff: {s}\n", .{capture.errorMessage(err)});
         std.process.exit(1);
-    }
-    capture_fd = @intCast(rc);
-    defer std.posix.close(capture_fd);
+    };
+    defer capture.close(capture_handle.?);
 
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();

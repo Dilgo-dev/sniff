@@ -13,6 +13,11 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("glym", glym_dep.module("glym"));
 
+    // Windows needs Npcap's wpcap.dll for packet capture
+    if (target.result.os.tag == .windows) {
+        exe_mod.linkSystemLibrary("wpcap", .{});
+    }
+
     const exe = b.addExecutable(.{
         .name = "sniff",
         .root_module = exe_mod,
