@@ -14,8 +14,7 @@ const pcap = @import("pcap.zig");
 const Style = glym.style.Style;
 const Rgb = glym.style.Rgb;
 
-// -- Capture state (module-level for async_task compatibility) --
-
+// Module-level so async_task capture functions can access it.
 var capture_handle: ?capture.CaptureHandle = null;
 
 fn captureOne(_: std.mem.Allocator) anyerror!?App {
@@ -25,14 +24,11 @@ fn captureOne(_: std.mem.Allocator) anyerror!?App {
     if (frame.len < 14) return null;
     var info = packet.parse(frame) orelse return null;
     info.timestamp_ms = std.time.milliTimestamp();
-    // Store raw bytes snapshot for pcap export
     const snap = @min(frame.len, packet.snap_len);
     @memcpy(info.raw[0..snap], frame[0..snap]);
     info.raw_len = @intCast(snap);
     return .{ .captured = info };
 }
-
-// -- MVU types --
 
 const App = union(enum) {
     captured: packet.PacketInfo,
@@ -52,32 +48,25 @@ const Model = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     start_time: i64 = 0,
-    // Filter
     filter: filter_mod.Filter = .{},
     filter_buf: [128]u8 = .{0} ** 128,
     filter_len: u8 = 0,
-    // Search
     search_buf: [128]u8 = .{0} ** 128,
     search_len: u8 = 0,
     search_active: bool = false,
-    // Hex dump
     hex_view: bool = false,
     hex_scroll: usize = 0,
-    // Shared input state
     input_mode: InputMode = .none,
     input_buf: [128]u8 = .{0} ** 128,
     input_len: u8 = 0,
     input_cursor: u8 = 0,
     input_error: bool = false,
-    // Export status message (shown briefly in title bar)
     status_buf: [64]u8 = .{0} ** 64,
     status_len: u8 = 0,
     status_time: i64 = 0,
 };
 
 const max_packets = 50000;
-
-// -- MVU functions --
 
 fn init(_: std.mem.Allocator) anyerror!Model {
     return .{ .start_time = std.time.milliTimestamp() };
@@ -142,10 +131,6 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
     }
 
     if (!model.started) model.started = true;
-    // Always re-trigger capture on any event. On POSIX this spawns on
-    // the thread pool. On Windows (inline async) this drains all
-    // buffered packets via the non-blocking socket, then returns null
-    // to end the chain until the next tick (~50ms).
     if (model.started and !model.paused) return .{ .async_task = captureOne };
     return .none;
 }
@@ -331,7 +316,6 @@ fn applyExport(model: *Model) void {
 
     const filter_fn: ?*const fn (*const packet.PacketInfo) bool = if (model.filter.active)
         struct {
-            // Wrapper that captures the filter via the global model pointer
             fn matches(pkt: *const packet.PacketInfo) bool {
                 return export_filter.matches(pkt);
             }
@@ -339,7 +323,6 @@ fn applyExport(model: *Model) void {
     else
         null;
 
-    // Snapshot the active filter for the export callback
     export_filter = model.filter;
 
     const count = pcap.exportPackets(path, model.packets.items, filter_fn) catch {
@@ -367,7 +350,6 @@ fn applySearch(model: *Model) void {
     model.search_len = model.input_len;
     model.search_active = model.input_len > 0;
     if (model.search_active) {
-        // Jump to first match from current position
         searchNext(model, true);
     }
 }
@@ -375,10 +357,8 @@ fn applySearch(model: *Model) void {
 fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
     if (!model.search_active) return false;
     const term = model.search_buf[0..model.search_len];
-    // Match against addresses
     if (containsSubstring(pkt.srcAddr(), term)) return true;
     if (containsSubstring(pkt.dstAddr(), term)) return true;
-    // Match against ports as strings
     var pbuf: [8]u8 = undefined;
     if (pkt.src_port > 0) {
         const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.src_port}) catch "";
@@ -388,9 +368,7 @@ fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
         const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.dst_port}) catch "";
         if (containsSubstring(ps, term)) return true;
     }
-    // Match against protocol name
     if (containsSubstring(pkt.protocol.name(), term)) return true;
-    // Match against DNS domain name
     if (pkt.dns_name_len > 0 and containsSubstring(pkt.dnsName(), term)) return true;
     return false;
 }
@@ -463,8 +441,6 @@ fn adjustScroll(model: *Model) void {
     }
 }
 
-// -- View --
-
 const surface0: Rgb = .{ .r = 49, .g = 50, .b = 68 };
 const surface1: Rgb = .{ .r = 69, .g = 71, .b = 90 };
 const text_col: Rgb = .{ .r = 205, .g = 214, .b = 244 };
@@ -507,7 +483,6 @@ fn view(model: *Model, r: *P.Renderer) void {
         return;
     }
 
-    // Title bar
     r.fillRect(0, 0, 1, cols, .{ .char = ' ', .style = title_style });
     r.writeStyledText(0, 1, "sniff", title_style);
     {
@@ -516,7 +491,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         const s = std.fmt.bufPrint(&buf, " [{s}] {d} packets", .{ iface, model.packets.items.len }) catch "";
         r.writeStyledText(0, 7, s, title_style);
     }
-    // Status message (export result, etc.) - shown for 3 seconds
+    // Status disappears after 3 seconds
     const now = std.time.milliTimestamp();
     if (model.status_len > 0 and now - model.status_time < 3000) {
         const smsg = model.status_buf[0..model.status_len];
@@ -528,7 +503,6 @@ fn view(model: *Model, r: *P.Renderer) void {
     } else if (model.follow) {
         r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
     }
-    // Active filter/search indicators in title bar
     {
         var info_col: u16 = cols / 3;
         if (model.filter.active) {
@@ -552,7 +526,6 @@ fn view(model: *Model, r: *P.Renderer) void {
         viewPacketList(model, r, rows, cols);
     }
 
-    // Help bar / filter input
     const help_row: u16 = rows - 1;
     r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
     if (model.input_mode != .none) {
@@ -573,7 +546,6 @@ fn view(model: *Model, r: *P.Renderer) void {
         const plen: u16 = @intCast(prompt.len);
         const text = model.input_buf[0..model.input_len];
         r.writeStyledText(help_row, 1 + plen, text, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
-        // Cursor block
         const ccol: u16 = 1 + plen + @as(u16, model.input_cursor);
         const cch: u21 = if (model.input_cursor < model.input_len) model.input_buf[model.input_cursor] else ' ';
         r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
@@ -593,11 +565,9 @@ fn view(model: *Model, r: *P.Renderer) void {
 }
 
 fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
-    // Column headers
     writeColumns(r, 1, cols, "#", "Time", "Source", "Destination", "Proto", "Len", header_style);
     drawHLine(r, 2, cols);
 
-    // Packet list
     const lh = listHeight(rows);
     var i: usize = 0;
     while (i < lh) : (i += 1) {
@@ -636,11 +606,9 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         }
     }
 
-    // Separator before detail
     const sep_row: u16 = @intCast(@as(usize, rows) -| 4);
     drawHLine(r, sep_row, cols);
 
-    // Detail pane
     if (getVisible(model, model.selected)) |pkt| {
         const d1: u16 = sep_row + 1;
         const d2: u16 = sep_row + 2;
@@ -696,7 +664,6 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         return;
     };
 
-    // Header: packet summary
     {
         var hbuf: [80]u8 = undefined;
         const hs = std.fmt.bufPrint(&hbuf, "Packet #{d}  {s}:{d} -> {s}:{d}  {s}  {d} bytes", .{
@@ -712,14 +679,11 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     }
     drawHLine(r, 2, cols);
 
-    // Hex dump layout:
-    // OFFSET   00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F  |ASCII...........|
     const bytes_per_line: usize = 16;
     const raw = pkt.raw[0..pkt.raw_len];
     const total_lines = (raw.len + bytes_per_line - 1) / bytes_per_line;
     const visible = @as(usize, rows) -| 4; // rows 3..rows-2
 
-    // Clamp scroll
     if (total_lines > visible) {
         if (model.hex_scroll > total_lines - visible) {
             model.hex_scroll = total_lines - visible;
@@ -743,12 +707,10 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         const line_end = @min(byte_offset + bytes_per_line, raw.len);
         const line_bytes = raw[byte_offset..line_end];
 
-        // Offset column
         var off_buf: [8]u8 = undefined;
         const off_s = std.fmt.bufPrint(&off_buf, "{X:0>4}", .{byte_offset}) catch "";
         r.writeStyledText(row, 1, off_s, offset_style);
 
-        // Hex bytes
         var hcol: u16 = 7;
         for (line_bytes, 0..) |b, bi| {
             var hb: [3]u8 = undefined;
@@ -761,7 +723,6 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             }
         }
 
-        // ASCII column
         const ascii_col: u16 = 7 + 3 * 16 + 2;
         r.writeStyledText(row, ascii_col, "|", offset_style);
         for (line_bytes, 0..) |b, bi| {
@@ -772,7 +733,6 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         r.writeStyledText(row, ascii_col + 1 + @as(u16, @intCast(line_bytes.len)), "|", offset_style);
     }
 
-    // Scroll indicator
     if (total_lines > visible) {
         var sbuf: [32]u8 = undefined;
         const ss = std.fmt.bufPrint(&sbuf, "line {d}/{d}", .{ model.hex_scroll + 1, total_lines }) catch "";
@@ -858,8 +818,6 @@ fn fmtTime(timestamp_ms: i64, buf: *[12]u8) []const u8 {
     }) catch "??:??:??";
 }
 
-// -- Entry point --
-
 var active_iface: [32]u8 = .{0} ** 32;
 var active_iface_len: u8 = 0;
 
@@ -868,7 +826,6 @@ fn activeIfaceSlice() []const u8 {
 }
 
 pub fn main() !void {
-    // Parse CLI arguments
     var iface_arg: ?[]const u8 = null;
     var list_mode = false;
 
@@ -902,7 +859,6 @@ pub fn main() !void {
         }
     }
 
-    // List mode
     if (list_mode) {
         var ifaces: [capture.max_interfaces]capture.IfName = undefined;
         const count = capture.listInterfaces(&ifaces);
@@ -918,7 +874,6 @@ pub fn main() !void {
         return;
     }
 
-    // Store active interface name for display
     if (iface_arg) |name| {
         const len = @min(name.len, active_iface.len);
         @memcpy(active_iface[0..len], name[0..len]);

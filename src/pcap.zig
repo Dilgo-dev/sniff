@@ -1,8 +1,7 @@
 // Pcap file writer.
 //
-// Writes captured packets in the standard pcap format (little-endian,
-// microsecond timestamps, Ethernet link type). The output can be
-// opened in Wireshark, tcpdump, or any tool that reads pcap files.
+// Standard pcap format (little-endian, microsecond timestamps,
+// LINKTYPE_ETHERNET). Compatible with Wireshark and tcpdump.
 
 const std = @import("std");
 const packet = @import("packet.zig");
@@ -48,7 +47,6 @@ pub fn exportPackets(
     ) catch return error.CreateFailed;
     defer file.close();
 
-    // Global header
     const ghdr: GlobalHeader = .{};
     file.writeAll(std.mem.asBytes(&ghdr)) catch return error.WriteFailed;
 

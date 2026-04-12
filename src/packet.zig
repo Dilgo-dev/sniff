@@ -143,7 +143,6 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
             if (data.len >= 4) {
                 info.src_port = readU16(data, 0);
                 info.dst_port = readU16(data, 2);
-                // DNS runs on port 53 - parse the query name
                 if ((info.src_port == 53 or info.dst_port == 53) and data.len > 20) {
                     parseDns(data[8..], info);
                 }
@@ -156,12 +155,6 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
 }
 
 fn parseDns(data: []const u8, info: *PacketInfo) void {
-    // DNS header: 12 bytes minimum
-    // Bytes 0-1: Transaction ID
-    // Bytes 2-3: Flags (bit 15 = QR: 0=query, 1=response)
-    // Bytes 4-5: Question count
-    // Bytes 6-7: Answer count
-    // Byte 12+: Question section (QNAME + QTYPE + QCLASS)
     if (data.len < 13) return;
 
     const flags = readU16(data, 2);
@@ -169,18 +162,17 @@ fn parseDns(data: []const u8, info: *PacketInfo) void {
     const qcount = readU16(data, 4);
     if (qcount == 0) return;
 
-    // Decode QNAME: sequence of length-prefixed labels, ending with 0
+    // QNAME starts at byte 12: length-prefixed labels terminated by 0
     var pos: usize = 12;
     var out_pos: u8 = 0;
     while (pos < data.len) {
         const label_len = data[pos];
         if (label_len == 0) break;
-        // Pointer compression (top 2 bits set) - stop here
+        // Pointer compression - can't follow without the full message
         if (label_len & 0xC0 == 0xC0) break;
         pos += 1;
         if (pos + label_len > data.len) break;
 
-        // Add dot separator between labels
         if (out_pos > 0 and out_pos < 127) {
             info.dns_name[out_pos] = '.';
             out_pos += 1;

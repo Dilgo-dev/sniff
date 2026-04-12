@@ -89,7 +89,6 @@ pub fn parse(expr: []const u8) ?Filter {
     var tokens: [32][]const u8 = undefined;
     var count: usize = 0;
 
-    // Tokenize by whitespace
     var i: usize = 0;
     while (i < expr.len and count < 32) {
         while (i < expr.len and expr[i] == ' ') : (i += 1) {}
@@ -105,20 +104,17 @@ pub fn parse(expr: []const u8) ?Filter {
     while (ti < count) {
         const tok = tokens[ti];
 
-        // Skip "and" conjunctions
         if (std.mem.eql(u8, tok, "and") or std.mem.eql(u8, tok, "&&")) {
             ti += 1;
             continue;
         }
 
-        // DNS shorthand
         if (std.mem.eql(u8, tok, "dns")) {
             f.dns_only = true;
             ti += 1;
             continue;
         }
 
-        // Protocol
         if (std.mem.eql(u8, tok, "tcp")) {
             f.proto = .tcp;
             ti += 1;
@@ -140,7 +136,6 @@ pub fn parse(expr: []const u8) ?Filter {
             continue;
         }
 
-        // "port N"
         if (std.mem.eql(u8, tok, "port")) {
             ti += 1;
             if (ti >= count) return null;
@@ -149,7 +144,6 @@ pub fn parse(expr: []const u8) ?Filter {
             continue;
         }
 
-        // "host X.X.X.X"
         if (std.mem.eql(u8, tok, "host")) {
             ti += 1;
             if (ti >= count) return null;
@@ -158,7 +152,6 @@ pub fn parse(expr: []const u8) ?Filter {
             continue;
         }
 
-        // "src ..." / "dst ..."
         if (std.mem.eql(u8, tok, "src") or std.mem.eql(u8, tok, "dst")) {
             const is_src = tok[0] == 's';
             ti += 1;
@@ -183,7 +176,6 @@ pub fn parse(expr: []const u8) ?Filter {
                     f.dst_host.set(tokens[ti]);
                 }
             } else {
-                // "src X.X.X.X" without "host" keyword
                 if (is_src) {
                     f.src_host.set(next);
                 } else {
@@ -194,7 +186,6 @@ pub fn parse(expr: []const u8) ?Filter {
             continue;
         }
 
-        // "sport N" / "dport N" shorthand
         if (std.mem.eql(u8, tok, "sport")) {
             ti += 1;
             if (ti >= count) return null;
@@ -210,14 +201,11 @@ pub fn parse(expr: []const u8) ?Filter {
             continue;
         }
 
-        // Unknown token
         return null;
     }
 
     return f;
 }
-
-// -- Tests --
 
 test "empty expression matches everything" {
     const f = parse("").?;

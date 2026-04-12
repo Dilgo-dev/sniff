@@ -88,9 +88,7 @@ pub fn errorMessage(err: CaptureError) []const u8 {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Linux: AF_PACKET raw socket
-// ---------------------------------------------------------------------------
 
 const linux = if (builtin.os.tag == .linux) struct {
     const AF_PACKET: u32 = 17;
@@ -160,9 +158,7 @@ fn listLinuxIfaces(out: []IfName) usize {
     return count;
 }
 
-// ---------------------------------------------------------------------------
 // macOS: BPF (Berkeley Packet Filter)
-// ---------------------------------------------------------------------------
 
 const bpf = if (builtin.os.tag == .macos) struct {
     const BIOCSBLEN: c_ulong = 0xc0044266;
@@ -286,14 +282,13 @@ const bpf = if (builtin.os.tag == .macos) struct {
         var cur = ifap;
         while (cur) |ifa| : (cur = ifa.ifa_next) {
             if (count >= out.len) break;
-            // Skip down or loopback interfaces
             if (ifa.ifa_flags & IFF_UP == 0) continue;
             if (ifa.ifa_flags & IFF_LOOPBACK != 0) continue;
 
             const name = std.mem.span(ifa.ifa_name);
             if (name.len == 0 or name.len > 15) continue;
 
-            // Deduplicate (getifaddrs returns one entry per address)
+            // getifaddrs returns one entry per address, not per interface
             var dup = false;
             for (out[0..count]) |existing| {
                 if (std.mem.eql(u8, existing.slice(), name)) {
@@ -339,9 +334,9 @@ fn listMacIfaces(out: []IfName) usize {
     return bpf.listIfaces(out);
 }
 
-// ---------------------------------------------------------------------------
-// Windows: raw socket with SIO_RCVALL (zero dependencies)
-// ---------------------------------------------------------------------------
+// Windows: raw socket with SIO_RCVALL.
+// Packets arrive without Ethernet headers; readOne prepends a
+// synthetic header to keep the parser uniform across platforms.
 
 const win = if (builtin.os.tag == .windows) struct {
     const SOCKET = usize;
@@ -426,12 +421,10 @@ const win = if (builtin.os.tag == .windows) struct {
         const s = socket(2, 3, 0);
         if (s == INVALID_SOCKET) return error.PermissionDenied;
 
-        // Determine which IP to bind to
         const ip: u32 = blk: {
             if (iface) |name| {
-                // Try parsing as IP address directly
                 if (parseIp(name)) |addr| break :blk addr;
-                // Try matching by adapter index (nth address)
+                // Numeric index selects the nth host address
                 const idx = std.fmt.parseInt(usize, name, 10) catch {
                     _ = closesocket(s);
                     return error.NoDevice;
@@ -447,7 +440,6 @@ const win = if (builtin.os.tag == .windows) struct {
                 _ = closesocket(s);
                 return error.NoDevice;
             } else {
-                // Default: first address
                 const host = resolveHost() orelse {
                     _ = closesocket(s);
                     return error.NoDevice;
