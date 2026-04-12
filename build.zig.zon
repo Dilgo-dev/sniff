@@ -1,0 +1,14 @@
+.{
+    .name = .sniff,
+    .version = "0.1.0",
+    .fingerprint = 0x73d915d13a2df4bb,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{
+        .glym = .{ .path = "../glymmi/glym" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
