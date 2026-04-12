@@ -4,7 +4,10 @@
     .fingerprint = 0x73d915d13a2df4bb,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
-        .glym = .{ .path = "../../glymmi/glym" },
+        .glym = .{
+            .url = "git+https://github.com/glymmi/glym#495658ad486d26a3bd78d2cd8113394ad65eda6e",
+            .hash = "glym-0.0.1-rW-8WJ-RAQD11Aa-S2m5yy5jRZ6ZLKS0eg0B1GufuXqm",
+        },
     },
     .paths = .{
         "build.zig",
