@@ -64,12 +64,10 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
             model.cols = sz.cols;
         },
         .key => |k| {
-            const c = handleKey(model, k);
-            if (!model.started) {
-                model.started = true;
-                return .{ .async_task = captureOne };
+            switch (handleKey(model, k)) {
+                .quit => return .quit,
+                else => {},
             }
-            return c;
         },
         .app => |a| switch (a) {
             .captured => |pkt| {
@@ -102,10 +100,12 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
         else => {},
     }
 
-    if (!model.started) {
-        model.started = true;
-        return .{ .async_task = captureOne };
-    }
+    if (!model.started) model.started = true;
+    // Always re-trigger capture on any event. On POSIX this spawns on
+    // the thread pool. On Windows (inline async) this drains all
+    // buffered packets via the non-blocking socket, then returns null
+    // to end the chain until the next tick (~50ms).
+    if (model.started and !model.paused) return .{ .async_task = captureOne };
     return .none;
 }
 
