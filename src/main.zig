@@ -429,6 +429,7 @@ fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
     }
     if (containsSubstring(pkt.protocol.name(), term)) return true;
     if (pkt.dns_name_len > 0 and containsSubstring(pkt.dnsName(), term)) return true;
+    if (pkt.tls_sni_len > 0 and containsSubstring(pkt.sniName(), term)) return true;
     if (pkt.http_info_len > 0 and containsSubstring(pkt.httpInfo(), term)) return true;
     return false;
 }
@@ -723,6 +724,9 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             const label = if (pkt.dns_is_response) "DNS resp: " else "DNS: ";
             r.writeStyledText(d2, 42, label, detail_label_style);
             r.writeStyledText(d2, 42 + @as(u16, @intCast(label.len)), pkt.dnsName(), .{ .fg = .{ .rgb = c_yellow }, .bold = true });
+        } else if (pkt.tls_sni_len > 0) {
+            r.writeStyledText(d2, 42, "SNI: ", detail_label_style);
+            r.writeStyledText(d2, 47, pkt.sniName(), .{ .fg = .{ .rgb = c_mauve }, .bold = true });
         } else if (pkt.http_info_len > 0) {
             r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = c_peach }, .bold = true });
         }

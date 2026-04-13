@@ -45,6 +45,8 @@ pub const PacketInfo = struct {
     dns_is_response: bool = false,
     http_info: [128]u8 = .{0} ** 128,
     http_info_len: u8 = 0,
+    tls_sni: [253]u8 = .{0} ** 253,
+    tls_sni_len: u8 = 0,
     raw: [snap_len]u8 = .{0} ** snap_len,
     raw_len: u16 = 0,
 
@@ -66,6 +68,11 @@ pub const PacketInfo = struct {
     /// HTTP request/response summary, if detected.
     pub fn httpInfo(self: *const PacketInfo) []const u8 {
         return self.http_info[0..self.http_info_len];
+    }
+
+    /// TLS SNI hostname, if this is a TLS ClientHello with server_name.
+    pub fn sniName(self: *const PacketInfo) []const u8 {
+        return self.tls_sni[0..self.tls_sni_len];
     }
 
     /// Format TCP flags into a human-readable string.
@@ -145,7 +152,11 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
                 info.tcp_flags = data[13];
                 const data_off: usize = @as(usize, data[12] >> 4) * 4;
                 if (data_off >= 20 and data.len > data_off) {
-                    parseHttp(data[data_off..], info);
+                    const payload = data[data_off..];
+                    parseHttp(payload, info);
+                    if (info.http_info_len == 0) {
+                        parseTlsSni(payload, info);
+                    }
                 }
             }
         },
@@ -228,6 +239,79 @@ fn parseDns(data: []const u8, info: *PacketInfo) void {
         pos += label_len;
     }
     info.dns_name_len = out_pos;
+}
+
+fn parseTlsSni(payload: []const u8, info: *PacketInfo) void {
+    // TLS record: content_type(1) + version(2) + length(2) = 5
+    if (payload.len < 5) return;
+    if (payload[0] != 0x16) return; // not Handshake
+    const rec_len = readU16(payload, 3);
+    const rec_end = @min(@as(usize, 5) + rec_len, payload.len);
+    const hs = payload[5..rec_end];
+
+    // Handshake: type(1) + length(3) + body
+    if (hs.len < 4) return;
+    if (hs[0] != 0x01) return; // not ClientHello
+    const hs_len = @as(usize, hs[1]) << 16 | @as(usize, hs[2]) << 8 | @as(usize, hs[3]);
+    const body = hs[4..@min(4 + hs_len, hs.len)];
+
+    // ClientHello: version(2) + random(32) + session_id(1+var)
+    if (body.len < 35) return;
+    var pos: usize = 34;
+    const sid_len = body[pos];
+    pos += 1 + sid_len;
+    if (pos + 2 > body.len) return;
+
+    // cipher_suites: length(2) + var
+    const cs_len = @as(usize, readU16(body, pos));
+    pos += 2 + cs_len;
+    if (pos + 1 > body.len) return;
+
+    // compression_methods: length(1) + var
+    const cm_len = @as(usize, body[pos]);
+    pos += 1 + cm_len;
+    if (pos + 2 > body.len) return;
+
+    // extensions: total_length(2) + var
+    const ext_total = @as(usize, readU16(body, pos));
+    pos += 2;
+    const ext_end = @min(pos + ext_total, body.len);
+
+    while (pos + 4 <= ext_end) {
+        const ext_type = readU16(body, pos);
+        const ext_len = @as(usize, readU16(body, pos + 2));
+        pos += 4;
+        if (pos + ext_len > ext_end) break;
+
+        if (ext_type == 0x0000) { // server_name
+            const sni_data = body[pos .. pos + ext_len];
+            extractSni(sni_data, info);
+            return;
+        }
+        pos += ext_len;
+    }
+}
+
+fn extractSni(data: []const u8, info: *PacketInfo) void {
+    // server_name_list: list_length(2) + entries
+    if (data.len < 5) return;
+    var pos: usize = 2;
+    const list_end = @min(@as(usize, readU16(data, 0)) + 2, data.len);
+
+    while (pos + 3 <= list_end) {
+        const name_type = data[pos];
+        const name_len = @as(usize, readU16(data, pos + 1));
+        pos += 3;
+        if (pos + name_len > list_end) break;
+
+        if (name_type == 0x00) { // host_name
+            const n = @min(name_len, 253);
+            @memcpy(info.tls_sni[0..n], data[pos..][0..n]);
+            info.tls_sni_len = @intCast(n);
+            return;
+        }
+        pos += name_len;
+    }
 }
 
 fn parseArp(data: []const u8, info: *PacketInfo) void {
@@ -462,4 +546,142 @@ test "parse HTTP response" {
 
     const info = parse(&frame).?;
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK", info.httpInfo());
+}
+
+test "parse TLS ClientHello extracts SNI" {
+    // Build a minimal TLS ClientHello with SNI extension for "example.com"
+    const hostname = "example.com";
+
+    // SNI extension payload: list_len(2) + type(1) + name_len(2) + name
+    const sni_payload_len = 2 + 1 + 2 + hostname.len;
+    // Extension: type(2) + length(2) + payload
+    const ext_block_len = 4 + sni_payload_len;
+    // Extensions header: total_length(2) + ext_block
+    const extensions_len = 2 + ext_block_len;
+
+    // ClientHello body: version(2) + random(32) + session_id_len(1)
+    //   + cipher_suites_len(2) + one suite(2) + comp_len(1) + comp(1) + extensions
+    const ch_body_len = 2 + 32 + 1 + 2 + 2 + 1 + 1 + extensions_len;
+    // Handshake: type(1) + length(3) + body
+    const hs_len = 4 + ch_body_len;
+    // TLS record: type(1) + version(2) + length(2) + handshake
+    const tls_len = 5 + hs_len;
+
+    const header_len = 14 + 20 + 20; // Ethernet + IPv4 + TCP
+    var frame: [header_len + tls_len]u8 = .{0} ** (header_len + tls_len);
+
+    // Ethernet: IPv4
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    // IPv4
+    frame[14] = 0x45;
+    frame[23] = 6; // TCP
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    // TCP: src 54321, dst 443, data offset 5
+    frame[34] = 0xD4;
+    frame[35] = 0x31;
+    frame[36] = 0x01;
+    frame[37] = 0xBB; // 443
+    frame[46] = 0x50;
+
+    // TLS record header
+    var pos: usize = header_len;
+    frame[pos] = 0x16; // Handshake
+    frame[pos + 1] = 0x03;
+    frame[pos + 2] = 0x01; // TLS 1.0
+    frame[pos + 3] = @intCast(hs_len >> 8);
+    frame[pos + 4] = @intCast(hs_len & 0xFF);
+    pos += 5;
+
+    // Handshake header
+    frame[pos] = 0x01; // ClientHello
+    frame[pos + 1] = @intCast(ch_body_len >> 16);
+    frame[pos + 2] = @intCast((ch_body_len >> 8) & 0xFF);
+    frame[pos + 3] = @intCast(ch_body_len & 0xFF);
+    pos += 4;
+
+    // ClientHello version
+    frame[pos] = 0x03;
+    frame[pos + 1] = 0x03; // TLS 1.2
+    pos += 2;
+
+    // Random (32 bytes of zeros)
+    pos += 32;
+
+    // Session ID length = 0
+    frame[pos] = 0;
+    pos += 1;
+
+    // Cipher suites: length 2, one suite
+    frame[pos] = 0x00;
+    frame[pos + 1] = 0x02;
+    frame[pos + 2] = 0xC0;
+    frame[pos + 3] = 0x2F;
+    pos += 4;
+
+    // Compression methods: length 1, null
+    frame[pos] = 0x01;
+    frame[pos + 1] = 0x00;
+    pos += 2;
+
+    // Extensions total length
+    frame[pos] = @intCast(ext_block_len >> 8);
+    frame[pos + 1] = @intCast(ext_block_len & 0xFF);
+    pos += 2;
+
+    // SNI extension type = 0x0000
+    frame[pos] = 0x00;
+    frame[pos + 1] = 0x00;
+    // Extension length
+    frame[pos + 2] = @intCast(sni_payload_len >> 8);
+    frame[pos + 3] = @intCast(sni_payload_len & 0xFF);
+    pos += 4;
+
+    // Server name list length
+    const name_entry_len = 1 + 2 + hostname.len;
+    frame[pos] = @intCast(name_entry_len >> 8);
+    frame[pos + 1] = @intCast(name_entry_len & 0xFF);
+    pos += 2;
+
+    // Host name type = 0
+    frame[pos] = 0x00;
+    // Host name length
+    frame[pos + 1] = @intCast(hostname.len >> 8);
+    frame[pos + 2] = @intCast(hostname.len & 0xFF);
+    pos += 3;
+
+    // Host name
+    @memcpy(frame[pos..][0..hostname.len], hostname);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(Protocol.tcp, info.protocol);
+    try std.testing.expectEqual(@as(u16, 443), info.dst_port);
+    try std.testing.expectEqualStrings("example.com", info.sniName());
+    try std.testing.expectEqual(@as(u8, 0), info.http_info_len);
+}
+
+test "non-TLS TCP payload does not set SNI" {
+    const payload = "some random data that is not TLS";
+    const header_len = 14 + 20 + 20;
+    var frame: [header_len + payload.len]u8 = .{0} ** (header_len + payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0xD4;
+    frame[35] = 0x31;
+    frame[36] = 0x01;
+    frame[37] = 0xBB;
+    frame[46] = 0x50;
+    @memcpy(frame[header_len..], payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(@as(u8, 0), info.tls_sni_len);
 }
