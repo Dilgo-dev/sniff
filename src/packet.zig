@@ -337,13 +337,59 @@ fn fmtIpv4(bytes: []const u8, out: *[46]u8) u8 {
 
 fn fmtIpv6(bytes: []const u8, out: *[46]u8) u8 {
     if (bytes.len < 16) return 0;
-    const s = std.fmt.bufPrint(out, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}", .{
-        readU16(bytes, 0),  readU16(bytes, 2),
-        readU16(bytes, 4),  readU16(bytes, 6),
-        readU16(bytes, 8),  readU16(bytes, 10),
-        readU16(bytes, 12), readU16(bytes, 14),
-    }) catch return 0;
-    return @intCast(s.len);
+
+    var groups: [8]u16 = undefined;
+    for (0..8) |i| {
+        groups[i] = readU16(bytes, i * 2);
+    }
+
+    // RFC 5952: find the longest run of consecutive zero groups.
+    // On tie, first run wins.
+    var best_start: usize = 8;
+    var best_len: usize = 0;
+    var run_start: usize = 0;
+    var run_len: usize = 0;
+    for (0..8) |i| {
+        if (groups[i] == 0) {
+            if (run_len == 0) run_start = i;
+            run_len += 1;
+        } else {
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_len = 0;
+        }
+    }
+    if (run_len > best_len) {
+        best_start = run_start;
+        best_len = run_len;
+    }
+    // RFC 5952: do not compress a single zero group
+    if (best_len <= 1) {
+        best_start = 8;
+        best_len = 0;
+    }
+
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < 8) {
+        if (i == best_start) {
+            out[pos] = ':';
+            out[pos + 1] = ':';
+            pos += 2;
+            i += best_len;
+            continue;
+        }
+        if (i > 0 and pos > 0 and out[pos - 1] != ':') {
+            out[pos] = ':';
+            pos += 1;
+        }
+        const s = std.fmt.bufPrint(out[pos..], "{x}", .{groups[i]}) catch return 0;
+        pos += s.len;
+        i += 1;
+    }
+    return @intCast(pos);
 }
 
 // -- Tests --
@@ -684,4 +730,42 @@ test "non-TLS TCP payload does not set SNI" {
 
     const info = parse(&frame).?;
     try std.testing.expectEqual(@as(u8, 0), info.tls_sni_len);
+}
+
+test "fmtIpv6 compresses longest zero run" {
+    var out: [46]u8 = undefined;
+    // 2001:db8:0:0:0:0:0:1 -> 2001:db8::1
+    var bytes = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    var len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("2001:db8::1", out[0..len]);
+
+    // ::1 (loopback)
+    bytes = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("::1", out[0..len]);
+
+    // :: (all zeros)
+    bytes = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("::", out[0..len]);
+
+    // fe80::1 (link-local)
+    bytes = [16]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("fe80::1", out[0..len]);
+
+    // No compression for single zero group: 2001:db8:0:1:0:0:0:1
+    bytes = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
+    len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("2001:db8:0:1::1", out[0..len]);
+
+    // No zero runs: all groups non-zero
+    bytes = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6 };
+    len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("2001:db8:1:2:3:4:5:6", out[0..len]);
+
+    // Trailing zeros: 2001:db8:1:0:0:0:0:0 -> 2001:db8:1::
+    bytes = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    len = fmtIpv6(&bytes, &out);
+    try std.testing.expectEqualStrings("2001:db8:1::", out[0..len]);
 }
