@@ -926,8 +926,8 @@ fn getVisible(model: *const Model, idx: usize) ?packet.PacketInfo {
 }
 
 fn listHeight(rows: u16) usize {
-    if (rows < 10) return 1;
-    return @as(usize, rows) - 7;
+    if (rows < 11) return 1;
+    return @as(usize, rows) - 8;
 }
 
 fn adjustScroll(model: *Model) void {
@@ -1135,12 +1135,13 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         }
     }
 
-    const sep_row: u16 = @intCast(@as(usize, rows) -| 4);
+    const sep_row: u16 = @intCast(@as(usize, rows) -| 5);
     drawHLine(r, sep_row, cols, sep_style);
 
     if (getVisible(model, model.selected)) |pkt| {
         const d1: u16 = sep_row + 1;
         const d2: u16 = sep_row + 2;
+        const d3: u16 = sep_row + 3;
 
         r.writeStyledText(d1, 1, "Src: ", dl_style);
         r.writeStyledText(d1, 6, pkt.srcAddr(), dv_style);
@@ -1197,6 +1198,26 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             r.writeStyledText(d2, 47, pkt.sniName(), .{ .fg = .{ .rgb = t.mauve }, .bold = true });
         } else if (pkt.http_info_len > 0) {
             r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = t.peach }, .bold = true });
+        }
+        if (pkt.tls_cert_cn_len > 0) {
+            r.writeStyledText(d3, 1, "Cert CN: ", dl_style);
+            r.writeStyledText(d3, 10, pkt.certCn(), .{ .fg = .{ .rgb = t.green }, .bold = true });
+            if (pkt.tls_cert_expiry_len > 0) {
+                var exp_col: u16 = @intCast(10 + pkt.certCn().len + 2);
+                r.writeStyledText(d3, exp_col, "Expires: ", dl_style);
+                exp_col += 9;
+                r.writeStyledText(d3, exp_col, pkt.certExpiry(), .{ .fg = .{ .rgb = t.peach } });
+            }
+            if (pkt.tls_cert_san_len > 0) {
+                const san_label = "  SAN: ";
+                var san_col: u16 = 42;
+                r.writeStyledText(d3, san_col, san_label, dl_style);
+                san_col += @intCast(san_label.len);
+                const max_san_w: u16 = if (cols > san_col + 1) cols - san_col - 1 else 0;
+                const san_text = pkt.certSan();
+                const show_len = @min(san_text.len, max_san_w);
+                r.writeStyledText(d3, san_col, san_text[0..show_len], .{ .fg = .{ .rgb = t.mauve } });
+            }
         }
     }
 }
@@ -1901,6 +1922,18 @@ fn writePacketJson(writer: anytype, pkt: *const packet.PacketInfo) !void {
     if (pkt.tls_sni_len > 0) {
         try writer.writeAll(",\"sni\":");
         try writeJsonString(writer, pkt.sniName());
+    }
+    if (pkt.tls_cert_cn_len > 0) {
+        try writer.writeAll(",\"cert_cn\":");
+        try writeJsonString(writer, pkt.certCn());
+    }
+    if (pkt.tls_cert_san_len > 0) {
+        try writer.writeAll(",\"cert_san\":");
+        try writeJsonString(writer, pkt.certSan());
+    }
+    if (pkt.tls_cert_expiry_len > 0) {
+        try writer.writeAll(",\"cert_expiry\":");
+        try writeJsonString(writer, pkt.certExpiry());
     }
     if (pkt.http_info_len > 0) {
         try writer.writeAll(",\"http\":");

@@ -98,6 +98,12 @@ pub const PacketInfo = struct {
     http_info_len: u8 = 0,
     tls_sni: [253]u8 = .{0} ** 253,
     tls_sni_len: u8 = 0,
+    tls_cert_cn: [128]u8 = .{0} ** 128,
+    tls_cert_cn_len: u8 = 0,
+    tls_cert_san: [256]u8 = .{0} ** 256,
+    tls_cert_san_len: u16 = 0,
+    tls_cert_expiry: [20]u8 = .{0} ** 20,
+    tls_cert_expiry_len: u8 = 0,
     quic_state: QuicState = .none,
     app_proto: AppProto = .none,
     raw: [snap_len]u8 = .{0} ** snap_len,
@@ -133,6 +139,21 @@ pub const PacketInfo = struct {
     /// TLS SNI hostname, if this is a TLS ClientHello with server_name.
     pub fn sniName(self: *const PacketInfo) []const u8 {
         return self.tls_sni[0..self.tls_sni_len];
+    }
+
+    /// Subject CN from the first certificate in a TLS Certificate message.
+    pub fn certCn(self: *const PacketInfo) []const u8 {
+        return self.tls_cert_cn[0..self.tls_cert_cn_len];
+    }
+
+    /// Comma-separated SAN dNSName entries from the server certificate.
+    pub fn certSan(self: *const PacketInfo) []const u8 {
+        return self.tls_cert_san[0..self.tls_cert_san_len];
+    }
+
+    /// Expiration date (notAfter) from the server certificate.
+    pub fn certExpiry(self: *const PacketInfo) []const u8 {
+        return self.tls_cert_expiry[0..self.tls_cert_expiry_len];
     }
 
     /// Format TCP flags into a human-readable string.
@@ -219,7 +240,7 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
                     } else {
                         parseHttp(payload, info);
                         if (info.http_info_len == 0) {
-                            parseTlsSni(payload, info);
+                            parseTls(payload, info);
                         }
                     }
                 }
@@ -317,38 +338,53 @@ fn parseDns(data: []const u8, info: *PacketInfo) void {
     info.dns_name_len = out_pos;
 }
 
-fn parseTlsSni(payload: []const u8, info: *PacketInfo) void {
-    // TLS record: content_type(1) + version(2) + length(2) = 5
-    if (payload.len < 5) return;
-    if (payload[0] != 0x16) return; // not Handshake
-    const rec_len = readU16(payload, 3);
-    const rec_end = @min(@as(usize, 5) + rec_len, payload.len);
-    const hs = payload[5..rec_end];
+fn parseTls(payload: []const u8, info: *PacketInfo) void {
+    var offset: usize = 0;
+    while (offset + 5 <= payload.len) {
+        if (payload[offset] != 0x16) break;
+        const rec_len = @as(usize, readU16(payload, offset + 3));
+        const rec_start = offset + 5;
+        const rec_end = @min(rec_start + rec_len, payload.len);
+        if (rec_start >= rec_end) break;
+        parseTlsHandshakes(payload[rec_start..rec_end], info);
+        offset = rec_end;
+    }
+}
 
-    // Handshake: type(1) + length(3) + body
-    if (hs.len < 4) return;
-    if (hs[0] != 0x01) return; // not ClientHello
-    const hs_len = @as(usize, hs[1]) << 16 | @as(usize, hs[2]) << 8 | @as(usize, hs[3]);
-    const body = hs[4..@min(4 + hs_len, hs.len)];
+fn parseTlsHandshakes(data: []const u8, info: *PacketInfo) void {
+    var pos: usize = 0;
+    while (pos + 4 <= data.len) {
+        const hs_type = data[pos];
+        const hs_len = @as(usize, data[pos + 1]) << 16 | @as(usize, data[pos + 2]) << 8 | @as(usize, data[pos + 3]);
+        const body_start = pos + 4;
+        const body_end = @min(body_start + hs_len, data.len);
+        if (body_start > body_end) break;
+        const body = data[body_start..body_end];
 
-    // ClientHello: version(2) + random(32) + session_id(1+var)
+        switch (hs_type) {
+            0x01 => parseClientHello(body, info),
+            0x0B => parseCertificateMsg(body, info),
+            else => {},
+        }
+        pos = body_end;
+    }
+}
+
+fn parseClientHello(body: []const u8, info: *PacketInfo) void {
     if (body.len < 35) return;
     var pos: usize = 34;
     const sid_len = body[pos];
     pos += 1 + sid_len;
     if (pos + 2 > body.len) return;
 
-    // cipher_suites: length(2) + var
     const cs_len = @as(usize, readU16(body, pos));
     pos += 2 + cs_len;
     if (pos + 1 > body.len) return;
 
-    // compression_methods: length(1) + var
     const cm_len = @as(usize, body[pos]);
     pos += 1 + cm_len;
     if (pos + 2 > body.len) return;
 
-    // extensions: total_length(2) + var
     const ext_total = @as(usize, readU16(body, pos));
     pos += 2;
     const ext_end = @min(pos + ext_total, body.len);
@@ -359,9 +395,8 @@ fn parseTlsSni(payload: []const u8, info: *PacketInfo) void {
         pos += 4;
         if (pos + ext_len > ext_end) break;
 
-        if (ext_type == 0x0000) { // server_name
-            const sni_data = body[pos .. pos + ext_len];
-            extractSni(sni_data, info);
+        if (ext_type == 0x0000) {
+            extractSni(body[pos .. pos + ext_len], info);
             return;
         }
         pos += ext_len;
@@ -369,7 +404,6 @@ fn parseTlsSni(payload: []const u8, info: *PacketInfo) void {
 }
 
 fn extractSni(data: []const u8, info: *PacketInfo) void {
-    // server_name_list: list_length(2) + entries
     if (data.len < 5) return;
     var pos: usize = 2;
     const list_end = @min(@as(usize, readU16(data, 0)) + 2, data.len);
@@ -380,7 +414,7 @@ fn extractSni(data: []const u8, info: *PacketInfo) void {
         pos += 3;
         if (pos + name_len > list_end) break;
 
-        if (name_type == 0x00) { // host_name
+        if (name_type == 0x00) {
             const n = @min(name_len, 253);
             @memcpy(info.tls_sni[0..n], data[pos..][0..n]);
             info.tls_sni_len = @intCast(n);
@@ -388,6 +422,280 @@ fn extractSni(data: []const u8, info: *PacketInfo) void {
         }
         pos += name_len;
     }
+}
+
+fn parseCertificateMsg(body: []const u8, info: *PacketInfo) void {
+    if (body.len < 3) return;
+    const certs_len = @as(usize, body[0]) << 16 | @as(usize, body[1]) << 8 | @as(usize, body[2]);
+    var pos: usize = 3;
+    const certs_end = @min(pos + certs_len, body.len);
+
+    // Only parse the first certificate (server's own cert)
+    if (pos + 3 > certs_end) return;
+    const cert_len = @as(usize, body[pos]) << 16 | @as(usize, body[pos + 1]) << 8 | @as(usize, body[pos + 2]);
+    pos += 3;
+    if (pos + cert_len > certs_end) return;
+    parseX509(body[pos .. pos + cert_len], info);
+}
+
+// -- Minimal X.509 DER parser --
+
+const DerElement = struct {
+    tag: u8,
+    value: []const u8,
+    header_len: usize,
+};
+
+fn readDer(data: []const u8) ?DerElement {
+    if (data.len < 2) return null;
+    const tag = data[0];
+    var len: usize = undefined;
+    var hdr: usize = undefined;
+    if (data[1] & 0x80 == 0) {
+        len = data[1];
+        hdr = 2;
+    } else {
+        const n = data[1] & 0x7F;
+        if (n == 0 or n > 4 or 2 + n > data.len) return null;
+        len = 0;
+        for (0..n) |i| {
+            len = (len << 8) | data[2 + i];
+        }
+        hdr = 2 + n;
+    }
+    if (hdr + len > data.len) return null;
+    return .{ .tag = tag, .value = data[hdr .. hdr + len], .header_len = hdr };
+}
+
+fn skipDer(data: []const u8) usize {
+    const e = readDer(data) orelse return data.len;
+    return e.header_len + e.value.len;
+}
+
+fn parseX509(cert: []const u8, info: *PacketInfo) void {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    const outer = readDer(cert) orelse return;
+    if (outer.tag != 0x30) return;
+    const tbs_elem = readDer(outer.value) orelse return;
+    if (tbs_elem.tag != 0x30) return;
+    parseTbsCertificate(tbs_elem.value, info);
+}
+
+fn parseTbsCertificate(tbs: []const u8, info: *PacketInfo) void {
+    var pos: usize = 0;
+
+    // version [0] EXPLICIT - optional, skip if present
+    if (pos < tbs.len and tbs[pos] == 0xA0) {
+        pos += skipDer(tbs[pos..]);
+    }
+    // serialNumber INTEGER
+    pos += skipDer(tbs[pos..]);
+    // signature AlgorithmIdentifier SEQUENCE
+    pos += skipDer(tbs[pos..]);
+    // issuer Name SEQUENCE
+    pos += skipDer(tbs[pos..]);
+
+    // validity SEQUENCE { notBefore, notAfter }
+    if (pos >= tbs.len) return;
+    const validity = readDer(tbs[pos..]) orelse return;
+    if (validity.tag == 0x30) {
+        parseValidity(validity.value, info);
+    }
+    pos += validity.header_len + validity.value.len;
+
+    // subject Name SEQUENCE
+    if (pos >= tbs.len) return;
+    const subject = readDer(tbs[pos..]) orelse return;
+    if (subject.tag == 0x30) {
+        extractCn(subject.value, info);
+    }
+    pos += subject.header_len + subject.value.len;
+
+    // subjectPublicKeyInfo SEQUENCE
+    pos += skipDer(tbs[pos..]);
+
+    // Optional: issuerUniqueID [1], subjectUniqueID [2], extensions [3]
+    while (pos < tbs.len) {
+        if (tbs[pos] == 0xA3) {
+            const ext_wrapper = readDer(tbs[pos..]) orelse return;
+            parseExtensions(ext_wrapper.value, info);
+            return;
+        }
+        pos += skipDer(tbs[pos..]);
+    }
+}
+
+fn parseValidity(data: []const u8, info: *PacketInfo) void {
+    // Validity ::= SEQUENCE { notBefore Time, notAfter Time }
+    const not_before_size = skipDer(data);
+    if (not_before_size >= data.len) return;
+    const not_after = readDer(data[not_before_size..]) orelse return;
+    // UTCTime (0x17) or GeneralizedTime (0x18)
+    if (not_after.tag == 0x17) {
+        formatUtcTime(not_after.value, info);
+    } else if (not_after.tag == 0x18) {
+        formatGenTime(not_after.value, info);
+    }
+}
+
+fn formatUtcTime(data: []const u8, info: *PacketInfo) void {
+    // UTCTime: YYMMDDHHMMSSZ (13 bytes)
+    if (data.len < 13) return;
+    var buf: [20]u8 = undefined;
+    // Year: 00-49 -> 2000-2049, 50-99 -> 1950-1999
+    const y0 = data[0] -| '0';
+    const y1 = data[1] -| '0';
+    const year = @as(u16, y0) * 10 + y1;
+    const century: []const u8 = if (year < 50) "20" else "19";
+    const s = std.fmt.bufPrint(&buf, "{s}{c}{c}-{c}{c}-{c}{c} {c}{c}:{c}{c}:{c}{c}", .{
+        century,
+        data[0],
+        data[1],
+        data[2],
+        data[3],
+        data[4],
+        data[5],
+        data[6],
+        data[7],
+        data[8],
+        data[9],
+        data[10],
+        data[11],
+    }) catch return;
+    const n = @min(s.len, 20);
+    @memcpy(info.tls_cert_expiry[0..n], s[0..n]);
+    info.tls_cert_expiry_len = @intCast(n);
+}
+
+fn formatGenTime(data: []const u8, info: *PacketInfo) void {
+    // GeneralizedTime: YYYYMMDDHHMMSSZ (15 bytes)
+    if (data.len < 15) return;
+    var buf: [20]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{c}{c}{c}{c}-{c}{c}-{c}{c} {c}{c}:{c}{c}:{c}{c}", .{
+        data[0],
+        data[1],
+        data[2],
+        data[3],
+        data[4],
+        data[5],
+        data[6],
+        data[7],
+        data[8],
+        data[9],
+        data[10],
+        data[11],
+        data[12],
+        data[13],
+    }) catch return;
+    const n = @min(s.len, 20);
+    @memcpy(info.tls_cert_expiry[0..n], s[0..n]);
+    info.tls_cert_expiry_len = @intCast(n);
+}
+
+// OID 2.5.4.3 (id-at-commonName) encoded as DER: 55 04 03
+const oid_cn = [_]u8{ 0x55, 0x04, 0x03 };
+
+fn extractCn(subject: []const u8, info: *PacketInfo) void {
+    // Name ::= SEQUENCE OF RelativeDistinguishedName
+    // RDN  ::= SET OF AttributeTypeAndValue
+    // ATAV ::= SEQUENCE { type OID, value ANY }
+    var pos: usize = 0;
+    while (pos < subject.len) {
+        const rdn = readDer(subject[pos..]) orelse return;
+        if (rdn.tag == 0x31) {
+            searchRdnForCn(rdn.value, info);
+            if (info.tls_cert_cn_len > 0) return;
+        }
+        pos += rdn.header_len + rdn.value.len;
+    }
+}
+
+fn searchRdnForCn(rdn: []const u8, info: *PacketInfo) void {
+    var pos: usize = 0;
+    while (pos < rdn.len) {
+        const atav = readDer(rdn[pos..]) orelse return;
+        if (atav.tag == 0x30) {
+            const oid_elem = readDer(atav.value) orelse {
+                pos += atav.header_len + atav.value.len;
+                continue;
+            };
+            if (oid_elem.tag == 0x06 and oid_elem.value.len == 3 and
+                std.mem.eql(u8, oid_elem.value, &oid_cn))
+            {
+                const val_off = oid_elem.header_len + oid_elem.value.len;
+                if (val_off < atav.value.len) {
+                    const val = readDer(atav.value[val_off..]) orelse {
+                        pos += atav.header_len + atav.value.len;
+                        continue;
+                    };
+                    const n = @min(val.value.len, 128);
+                    @memcpy(info.tls_cert_cn[0..n], val.value[0..n]);
+                    info.tls_cert_cn_len = @intCast(n);
+                    return;
+                }
+            }
+        }
+        pos += atav.header_len + atav.value.len;
+    }
+}
+
+// OID 2.5.29.17 (id-ce-subjectAltName) encoded as DER: 55 1D 11
+const oid_san = [_]u8{ 0x55, 0x1D, 0x11 };
+
+fn parseExtensions(data: []const u8, info: *PacketInfo) void {
+    // Extensions is wrapped in a SEQUENCE
+    const seq = readDer(data) orelse return;
+    if (seq.tag != 0x30) return;
+    var pos: usize = 0;
+    while (pos < seq.value.len) {
+        const ext = readDer(seq.value[pos..]) orelse return;
+        if (ext.tag == 0x30) {
+            parseSingleExtension(ext.value, info);
+            if (info.tls_cert_san_len > 0) return;
+        }
+        pos += ext.header_len + ext.value.len;
+    }
+}
+
+fn parseSingleExtension(ext_val: []const u8, info: *PacketInfo) void {
+    // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN OPTIONAL, extnValue OCTET STRING }
+    const oid_elem = readDer(ext_val) orelse return;
+    if (oid_elem.tag != 0x06) return;
+    if (oid_elem.value.len != 3 or !std.mem.eql(u8, oid_elem.value, &oid_san)) return;
+
+    var off = oid_elem.header_len + oid_elem.value.len;
+    // Skip optional BOOLEAN (critical)
+    if (off < ext_val.len and ext_val[off] == 0x01) {
+        off += skipDer(ext_val[off..]);
+    }
+    if (off >= ext_val.len) return;
+    const octet = readDer(ext_val[off..]) orelse return;
+    if (octet.tag != 0x04) return;
+    extractSanNames(octet.value, info);
+}
+
+fn extractSanNames(data: []const u8, info: *PacketInfo) void {
+    // SubjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName
+    const seq = readDer(data) orelse return;
+    if (seq.tag != 0x30) return;
+    var pos: usize = 0;
+    var out_pos: u16 = 0;
+    while (pos < seq.value.len) {
+        const gn = readDer(seq.value[pos..]) orelse break;
+        // context tag [2] = dNSName (tag 0x82)
+        if (gn.tag == 0x82 and gn.value.len > 0) {
+            if (out_pos > 0 and out_pos + 1 < 256) {
+                info.tls_cert_san[out_pos] = ',';
+                out_pos += 1;
+            }
+            const n: u16 = @intCast(@min(gn.value.len, @as(usize, 256) -| out_pos));
+            if (n == 0) break;
+            @memcpy(info.tls_cert_san[out_pos..][0..n], gn.value[0..n]);
+            out_pos += n;
+        }
+        pos += gn.header_len + gn.value.len;
+    }
+    info.tls_cert_san_len = out_pos;
 }
 
 fn parseQuic(payload: []const u8, info: *PacketInfo) void {
@@ -1069,4 +1377,364 @@ test "detect SSH banner in TCP payload" {
     try std.testing.expectEqual(AppProto.ssh, info.app_proto);
     try std.testing.expectEqualStrings("SSH", info.protoLabel());
     try std.testing.expectEqualStrings("SSH-2.0-OpenSSH_9.6", info.httpInfo());
+}
+
+fn buildDerLen(buf: []u8, length: usize) usize {
+    if (length < 128) {
+        buf[0] = @intCast(length);
+        return 1;
+    } else if (length < 256) {
+        buf[0] = 0x81;
+        buf[1] = @intCast(length);
+        return 2;
+    } else {
+        buf[0] = 0x82;
+        buf[1] = @intCast(length >> 8);
+        buf[2] = @intCast(length & 0xFF);
+        return 3;
+    }
+}
+
+fn wrapDer(buf: []u8, tag: u8, content: []const u8) usize {
+    buf[0] = tag;
+    var len_buf: [3]u8 = undefined;
+    const len_size = buildDerLen(&len_buf, content.len);
+    @memcpy(buf[1..][0..len_size], len_buf[0..len_size]);
+    @memcpy(buf[1 + len_size ..][0..content.len], content);
+    return 1 + len_size + content.len;
+}
+
+fn buildMinimalCert(buf: []u8) usize {
+    // Build a minimal X.509 cert with:
+    //   CN=example.com, SAN=example.com,www.example.com, notAfter=2027-06-15 12:00:00
+
+    // -- Subject CN --
+    const cn_value = "example.com";
+    // OID 2.5.4.3 for CN
+    const cn_oid = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x03 };
+    // CN value as UTF8String
+    var cn_str: [32]u8 = undefined;
+    const cn_str_len = wrapDer(&cn_str, 0x0C, cn_value);
+    // ATAV: SEQUENCE { OID, value }
+    var atav: [64]u8 = undefined;
+    @memcpy(atav[0..cn_oid.len], &cn_oid);
+    @memcpy(atav[cn_oid.len..][0..cn_str_len], cn_str[0..cn_str_len]);
+    var atav_seq: [70]u8 = undefined;
+    const atav_seq_len = wrapDer(&atav_seq, 0x30, atav[0 .. cn_oid.len + cn_str_len]);
+    // RDN: SET { ATAV }
+    var rdn: [76]u8 = undefined;
+    const rdn_len = wrapDer(&rdn, 0x31, atav_seq[0..atav_seq_len]);
+    // Subject: SEQUENCE { RDN }
+    var subject: [80]u8 = undefined;
+    const subject_len = wrapDer(&subject, 0x30, rdn[0..rdn_len]);
+
+    // -- Validity --
+    // notBefore: UTCTime "220101120000Z"
+    const not_before_val = "220101120000Z";
+    var not_before: [20]u8 = undefined;
+    const not_before_len = wrapDer(&not_before, 0x17, not_before_val);
+    // notAfter: UTCTime "270615120000Z"
+    const not_after_val = "270615120000Z";
+    var not_after: [20]u8 = undefined;
+    const not_after_len = wrapDer(&not_after, 0x17, not_after_val);
+    var validity_inner: [40]u8 = undefined;
+    @memcpy(validity_inner[0..not_before_len], not_before[0..not_before_len]);
+    @memcpy(validity_inner[not_before_len..][0..not_after_len], not_after[0..not_after_len]);
+    var validity: [48]u8 = undefined;
+    const validity_len = wrapDer(&validity, 0x30, validity_inner[0 .. not_before_len + not_after_len]);
+
+    // -- SAN extension --
+    const san1 = "example.com";
+    const san2 = "www.example.com";
+    var san_names_inner: [64]u8 = undefined;
+    var sp: usize = 0;
+    // dNSName [2] for san1
+    sp += wrapDer(san_names_inner[sp..], 0x82, san1);
+    // dNSName [2] for san2
+    sp += wrapDer(san_names_inner[sp..], 0x82, san2);
+    var san_seq: [70]u8 = undefined;
+    const san_seq_len = wrapDer(&san_seq, 0x30, san_names_inner[0..sp]);
+    // Wrap in OCTET STRING
+    var san_octet: [76]u8 = undefined;
+    const san_octet_len = wrapDer(&san_octet, 0x04, san_seq[0..san_seq_len]);
+    // Extension: SEQUENCE { OID 2.5.29.17, OCTET STRING }
+    const san_oid = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
+    var ext_inner: [90]u8 = undefined;
+    @memcpy(ext_inner[0..san_oid.len], &san_oid);
+    @memcpy(ext_inner[san_oid.len..][0..san_octet_len], san_octet[0..san_octet_len]);
+    var ext_seq: [96]u8 = undefined;
+    const ext_seq_len = wrapDer(&ext_seq, 0x30, ext_inner[0 .. san_oid.len + san_octet_len]);
+    // Extensions: SEQUENCE { extension }
+    var exts_seq: [100]u8 = undefined;
+    const exts_seq_len = wrapDer(&exts_seq, 0x30, ext_seq[0..ext_seq_len]);
+    // Wrap in context [3]
+    var exts_wrapper: [106]u8 = undefined;
+    const exts_wrapper_len = wrapDer(&exts_wrapper, 0xA3, exts_seq[0..exts_seq_len]);
+
+    // -- TBSCertificate --
+    // version [0] EXPLICIT INTEGER 2 (v3)
+    const version_int = [_]u8{ 0x02, 0x01, 0x02 }; // INTEGER 2
+    var version: [8]u8 = undefined;
+    const version_len = wrapDer(&version, 0xA0, &version_int);
+    // serialNumber: INTEGER 1
+    const serial = [_]u8{ 0x02, 0x01, 0x01 };
+    // signature AlgorithmIdentifier: SEQUENCE { OID sha256WithRSA }
+    const sig_alg = [_]u8{ 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00 };
+    // issuer: empty SEQUENCE
+    const issuer = [_]u8{ 0x30, 0x00 };
+    // subjectPublicKeyInfo: minimal SEQUENCE
+    const spki = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 };
+
+    var tbs_inner: [512]u8 = undefined;
+    var tp: usize = 0;
+    @memcpy(tbs_inner[tp..][0..version_len], version[0..version_len]);
+    tp += version_len;
+    @memcpy(tbs_inner[tp..][0..serial.len], &serial);
+    tp += serial.len;
+    @memcpy(tbs_inner[tp..][0..sig_alg.len], &sig_alg);
+    tp += sig_alg.len;
+    @memcpy(tbs_inner[tp..][0..issuer.len], &issuer);
+    tp += issuer.len;
+    @memcpy(tbs_inner[tp..][0..validity_len], validity[0..validity_len]);
+    tp += validity_len;
+    @memcpy(tbs_inner[tp..][0..subject_len], subject[0..subject_len]);
+    tp += subject_len;
+    @memcpy(tbs_inner[tp..][0..spki.len], &spki);
+    tp += spki.len;
+    @memcpy(tbs_inner[tp..][0..exts_wrapper_len], exts_wrapper[0..exts_wrapper_len]);
+    tp += exts_wrapper_len;
+
+    var tbs_seq: [520]u8 = undefined;
+    const tbs_seq_len = wrapDer(&tbs_seq, 0x30, tbs_inner[0..tp]);
+
+    // Certificate outer: SEQUENCE { tbs, sigAlg, sigValue }
+    var cert_inner: [560]u8 = undefined;
+    @memcpy(cert_inner[0..tbs_seq_len], tbs_seq[0..tbs_seq_len]);
+    @memcpy(cert_inner[tbs_seq_len..][0..sig_alg.len], &sig_alg);
+    const sig_val = [_]u8{ 0x03, 0x02, 0x00, 0x00 }; // BIT STRING, empty
+    @memcpy(cert_inner[tbs_seq_len + sig_alg.len ..][0..sig_val.len], &sig_val);
+    const cert_inner_len = tbs_seq_len + sig_alg.len + sig_val.len;
+    const cert_len = wrapDer(buf, 0x30, cert_inner[0..cert_inner_len]);
+    return cert_len;
+}
+
+test "parse TLS Certificate extracts CN, SAN and expiry" {
+    var cert_buf: [600]u8 = undefined;
+    const cert_len = buildMinimalCert(&cert_buf);
+
+    // TLS Certificate message: cert_list_length(3) + cert_length(3) + cert
+    const cert_list_len = 3 + cert_len;
+    const cert_msg_body_len = 3 + cert_list_len;
+    // Handshake: type(1) + length(3) + body
+    const hs_len = 4 + cert_msg_body_len;
+    const header_len = 14 + 20 + 20;
+
+    var frame: [header_len + 700]u8 = .{0} ** (header_len + 700);
+
+    // Ethernet + IPv4 + TCP headers
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26] = 10;
+    frame[29] = 2;
+    frame[30] = 10;
+    frame[33] = 1;
+    frame[34] = 0x01;
+    frame[35] = 0xBB; // src port 443
+    frame[36] = 0xD4;
+    frame[37] = 0x31;
+    frame[46] = 0x50;
+
+    var pos: usize = header_len;
+
+    // TLS record header
+    frame[pos] = 0x16; // Handshake
+    frame[pos + 1] = 0x03;
+    frame[pos + 2] = 0x03;
+    frame[pos + 3] = @intCast(hs_len >> 8);
+    frame[pos + 4] = @intCast(hs_len & 0xFF);
+    pos += 5;
+
+    // Handshake: Certificate (0x0B)
+    frame[pos] = 0x0B;
+    frame[pos + 1] = @intCast(cert_msg_body_len >> 16);
+    frame[pos + 2] = @intCast((cert_msg_body_len >> 8) & 0xFF);
+    frame[pos + 3] = @intCast(cert_msg_body_len & 0xFF);
+    pos += 4;
+
+    // Certificate list length
+    frame[pos] = @intCast(cert_list_len >> 16);
+    frame[pos + 1] = @intCast((cert_list_len >> 8) & 0xFF);
+    frame[pos + 2] = @intCast(cert_list_len & 0xFF);
+    pos += 3;
+
+    // First cert length
+    frame[pos] = @intCast(cert_len >> 16);
+    frame[pos + 1] = @intCast((cert_len >> 8) & 0xFF);
+    frame[pos + 2] = @intCast(cert_len & 0xFF);
+    pos += 3;
+
+    // Cert data
+    @memcpy(frame[pos..][0..cert_len], cert_buf[0..cert_len]);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqualStrings("example.com", info.certCn());
+    try std.testing.expectEqualStrings("example.com,www.example.com", info.certSan());
+    try std.testing.expectEqualStrings("2027-06-15 12:00:00", info.certExpiry());
+}
+
+test "TLS Certificate with no SAN extension only extracts CN and expiry" {
+    // Build a cert without SAN extension manually
+    const cn_value = "test.local";
+    const cn_oid = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x03 };
+    var cn_str: [32]u8 = undefined;
+    const cn_str_len = wrapDer(&cn_str, 0x0C, cn_value);
+    var atav: [64]u8 = undefined;
+    @memcpy(atav[0..cn_oid.len], &cn_oid);
+    @memcpy(atav[cn_oid.len..][0..cn_str_len], cn_str[0..cn_str_len]);
+    var atav_seq: [70]u8 = undefined;
+    const atav_seq_len = wrapDer(&atav_seq, 0x30, atav[0 .. cn_oid.len + cn_str_len]);
+    var rdn: [76]u8 = undefined;
+    const rdn_len = wrapDer(&rdn, 0x31, atav_seq[0..atav_seq_len]);
+    var subject: [80]u8 = undefined;
+    const subject_len = wrapDer(&subject, 0x30, rdn[0..rdn_len]);
+
+    const not_before_val = "220101000000Z";
+    var not_before: [20]u8 = undefined;
+    const not_before_len = wrapDer(&not_before, 0x17, not_before_val);
+    const not_after_val = "301231235959Z";
+    var not_after: [20]u8 = undefined;
+    const not_after_len = wrapDer(&not_after, 0x17, not_after_val);
+    var validity_inner: [40]u8 = undefined;
+    @memcpy(validity_inner[0..not_before_len], not_before[0..not_before_len]);
+    @memcpy(validity_inner[not_before_len..][0..not_after_len], not_after[0..not_after_len]);
+    var validity: [48]u8 = undefined;
+    const validity_len = wrapDer(&validity, 0x30, validity_inner[0 .. not_before_len + not_after_len]);
+
+    const version_int = [_]u8{ 0x02, 0x01, 0x02 };
+    var version: [8]u8 = undefined;
+    const version_len = wrapDer(&version, 0xA0, &version_int);
+    const serial = [_]u8{ 0x02, 0x01, 0x01 };
+    const sig_alg = [_]u8{ 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00 };
+    const issuer = [_]u8{ 0x30, 0x00 };
+    const spki = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 };
+
+    var tbs_inner: [300]u8 = undefined;
+    var tp: usize = 0;
+    @memcpy(tbs_inner[tp..][0..version_len], version[0..version_len]);
+    tp += version_len;
+    @memcpy(tbs_inner[tp..][0..serial.len], &serial);
+    tp += serial.len;
+    @memcpy(tbs_inner[tp..][0..sig_alg.len], &sig_alg);
+    tp += sig_alg.len;
+    @memcpy(tbs_inner[tp..][0..issuer.len], &issuer);
+    tp += issuer.len;
+    @memcpy(tbs_inner[tp..][0..validity_len], validity[0..validity_len]);
+    tp += validity_len;
+    @memcpy(tbs_inner[tp..][0..subject_len], subject[0..subject_len]);
+    tp += subject_len;
+    @memcpy(tbs_inner[tp..][0..spki.len], &spki);
+    tp += spki.len;
+    // No extensions
+
+    var tbs_seq: [320]u8 = undefined;
+    const tbs_seq_len = wrapDer(&tbs_seq, 0x30, tbs_inner[0..tp]);
+
+    var cert_inner: [360]u8 = undefined;
+    @memcpy(cert_inner[0..tbs_seq_len], tbs_seq[0..tbs_seq_len]);
+    @memcpy(cert_inner[tbs_seq_len..][0..sig_alg.len], &sig_alg);
+    const sig_val = [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    @memcpy(cert_inner[tbs_seq_len + sig_alg.len ..][0..sig_val.len], &sig_val);
+    const cert_inner_len = tbs_seq_len + sig_alg.len + sig_val.len;
+    var cert_buf: [400]u8 = undefined;
+    const cert_len = wrapDer(&cert_buf, 0x30, cert_inner[0..cert_inner_len]);
+
+    // Now wrap in TLS Certificate message
+    const cert_list_len = 3 + cert_len;
+    const cert_msg_body_len = 3 + cert_list_len;
+    const hs_len = 4 + cert_msg_body_len;
+    const hdr_len = 14 + 20 + 20;
+
+    var frame: [hdr_len + 500]u8 = .{0} ** (hdr_len + 500);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26] = 10;
+    frame[29] = 2;
+    frame[30] = 10;
+    frame[33] = 1;
+    frame[34] = 0x01;
+    frame[35] = 0xBB;
+    frame[36] = 0xD4;
+    frame[37] = 0x31;
+    frame[46] = 0x50;
+
+    var pos: usize = hdr_len;
+    frame[pos] = 0x16;
+    frame[pos + 1] = 0x03;
+    frame[pos + 2] = 0x03;
+    frame[pos + 3] = @intCast(hs_len >> 8);
+    frame[pos + 4] = @intCast(hs_len & 0xFF);
+    pos += 5;
+    frame[pos] = 0x0B;
+    frame[pos + 1] = @intCast(cert_msg_body_len >> 16);
+    frame[pos + 2] = @intCast((cert_msg_body_len >> 8) & 0xFF);
+    frame[pos + 3] = @intCast(cert_msg_body_len & 0xFF);
+    pos += 4;
+    frame[pos] = @intCast(cert_list_len >> 16);
+    frame[pos + 1] = @intCast((cert_list_len >> 8) & 0xFF);
+    frame[pos + 2] = @intCast(cert_list_len & 0xFF);
+    pos += 3;
+    frame[pos] = @intCast(cert_len >> 16);
+    frame[pos + 1] = @intCast((cert_len >> 8) & 0xFF);
+    frame[pos + 2] = @intCast(cert_len & 0xFF);
+    pos += 3;
+    @memcpy(frame[pos..][0..cert_len], cert_buf[0..cert_len]);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqualStrings("test.local", info.certCn());
+    try std.testing.expectEqualStrings("2030-12-31 23:59:59", info.certExpiry());
+    try std.testing.expectEqual(@as(u16, 0), info.tls_cert_san_len);
+}
+
+test "non-Certificate TLS handshake does not set cert fields" {
+    // A ServerHello (type 0x02) should not populate cert fields
+    const header_len = 14 + 20 + 20;
+    const sh_body_len: usize = 38; // version(2) + random(32) + session_id_len(1) + cipher(2) + comp(1)
+    const hs_len = 4 + sh_body_len;
+    const tls_len = 5 + hs_len;
+
+    var frame: [header_len + tls_len]u8 = .{0} ** (header_len + tls_len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26] = 10;
+    frame[29] = 2;
+    frame[30] = 10;
+    frame[33] = 1;
+    frame[34] = 0x01;
+    frame[35] = 0xBB;
+    frame[36] = 0xD4;
+    frame[37] = 0x31;
+    frame[46] = 0x50;
+
+    var pos: usize = header_len;
+    frame[pos] = 0x16;
+    frame[pos + 1] = 0x03;
+    frame[pos + 2] = 0x03;
+    frame[pos + 3] = @intCast(hs_len >> 8);
+    frame[pos + 4] = @intCast(hs_len & 0xFF);
+    pos += 5;
+    frame[pos] = 0x02; // ServerHello
+    frame[pos + 1] = 0x00;
+    frame[pos + 2] = @intCast((sh_body_len >> 8) & 0xFF);
+    frame[pos + 3] = @intCast(sh_body_len & 0xFF);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(@as(u8, 0), info.tls_cert_cn_len);
+    try std.testing.expectEqual(@as(u16, 0), info.tls_cert_san_len);
+    try std.testing.expectEqual(@as(u8, 0), info.tls_cert_expiry_len);
 }
