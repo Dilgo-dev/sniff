@@ -64,6 +64,8 @@ const themes = [_]Theme{
 };
 
 var initial_theme_idx: u8 = 0;
+var initial_col_widths: ColumnWidths = .{};
+var initial_col_widths_set: bool = false;
 
 // Module-level so async_task capture functions can access it.
 var capture_handle: ?capture.CaptureHandle = null;
@@ -137,6 +139,9 @@ const Model = struct {
     preset_selected: u8 = 0,
     presets: [max_presets]Preset = [_]Preset{.{}} ** max_presets,
     preset_count: u8 = 0,
+    col_widths: ColumnWidths = .{},
+    col_resize: bool = false,
+    col_selected: u3 = 0,
 
     fn th(self: *const Model) Theme {
         return themes[self.theme_idx % themes.len];
@@ -152,6 +157,55 @@ const Preset = struct {
     }
 };
 
+const ColumnWidths = struct {
+    num: u16 = 6,
+    time: u16 = 10,
+    src: u16 = 0,
+    dst: u16 = 0,
+    proto: u16 = 8,
+    len: u16 = 7,
+
+    fn srcWidth(self: ColumnWidths, cols: u16) u16 {
+        return if (self.src > 0) self.src else addrWidth(cols);
+    }
+
+    fn dstWidth(self: ColumnWidths, cols: u16) u16 {
+        return if (self.dst > 0) self.dst else addrWidth(cols);
+    }
+
+    fn colWidth(self: *const ColumnWidths, idx: u3, cols: u16) u16 {
+        return switch (idx) {
+            0 => self.num,
+            1 => self.time,
+            2 => self.srcWidth(cols),
+            3 => self.dstWidth(cols),
+            4 => self.proto,
+            5 => self.len,
+            else => 0,
+        };
+    }
+
+    fn setCol(self: *ColumnWidths, idx: u3, val: u16, cols: u16) void {
+        switch (idx) {
+            0 => self.num = val,
+            1 => self.time = val,
+            2 => {
+                if (self.src == 0) self.src = addrWidth(cols);
+                self.src = val;
+            },
+            3 => {
+                if (self.dst == 0) self.dst = addrWidth(cols);
+                self.dst = val;
+            },
+            4 => self.proto = val,
+            5 => self.len = val,
+            else => {},
+        }
+    }
+};
+
+const col_names = [6][]const u8{ "#", "Time", "Source", "Destination", "Proto", "Len" };
+
 const version = "0.1.0";
 const max_packets = 50000;
 const max_bw_samples = 300; // 5 minutes of per-second data
@@ -160,6 +214,11 @@ const max_presets = 20;
 fn init(_: std.mem.Allocator) anyerror!Model {
     var model: Model = .{ .start_time = std.time.milliTimestamp(), .theme_idx = initial_theme_idx };
     loadPresets(&model);
+    loadColumns(&model);
+    if (initial_col_widths_set) {
+        model.col_widths = initial_col_widths;
+        saveColumns(&model);
+    }
     return model;
 }
 
@@ -176,6 +235,8 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
         .key => |k| {
             if (model.preset_view) {
                 handlePresetKey(model, k);
+            } else if (model.col_resize) {
+                handleColResize(model, k);
             } else if (model.input_mode != .none) {
                 handleTextInput(model, k);
             } else {
@@ -294,6 +355,10 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 'F') model.follow = !model.follow;
             if (c == 'T') model.theme_idx = @intCast((model.theme_idx + 1) % themes.len);
             if (c == 'P') model.preset_view = !model.preset_view;
+            if (c == 'c') {
+                model.col_resize = true;
+                model.col_selected = 0;
+            }
         },
         .arrow_up => {
             if (model.hex_view or model.stream_view) {
@@ -402,6 +467,38 @@ fn handleMouse(model: *Model, me: glym.input.MouseEvent) void {
                 model.follow = false;
                 model.selected = pkt_idx;
             }
+        },
+        else => {},
+    }
+}
+
+fn handleColResize(model: *Model, k: glym.input.Key) void {
+    const min_w: u16 = 3;
+    const max_w: u16 = 60;
+    switch (k.code) {
+        .escape, .enter => {
+            model.col_resize = false;
+            saveColumns(model);
+        },
+        .char => |c| {
+            if (c == 'c' or c == 'q') {
+                model.col_resize = false;
+                saveColumns(model);
+            }
+        },
+        .arrow_left => {
+            if (model.col_selected > 0) model.col_selected -= 1;
+        },
+        .arrow_right => {
+            if (model.col_selected < 5) model.col_selected += 1;
+        },
+        .arrow_up => {
+            const cur = model.col_widths.colWidth(model.col_selected, model.cols);
+            if (cur < max_w) model.col_widths.setCol(model.col_selected, cur + 1, model.cols);
+        },
+        .arrow_down => {
+            const cur = model.col_widths.colWidth(model.col_selected, model.cols);
+            if (cur > min_w) model.col_widths.setCol(model.col_selected, cur - 1, model.cols);
         },
         else => {},
     }
@@ -606,6 +703,107 @@ fn savePresets(model: *const Model) void {
         _ = file.write(p.slice()) catch return;
         _ = file.write("\n") catch return;
     }
+}
+
+fn columnsPath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const home = std.posix.getenv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.config/sniff/columns.txt", .{home}) catch null;
+}
+
+fn loadColumns(model: *Model) void {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = columnsPath(&pbuf) orelse return;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return;
+    defer file.close();
+
+    var rbuf: [256]u8 = undefined;
+    const n = file.readAll(&rbuf) catch return;
+    const data = rbuf[0..n];
+
+    var start: usize = 0;
+    while (start < data.len) {
+        var end = start;
+        while (end < data.len and data[end] != '\n') : (end += 1) {}
+        const line = data[start..end];
+        if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+            const key = line[0..eq];
+            const val = std.fmt.parseInt(u16, line[eq + 1 ..], 10) catch {
+                start = end + 1;
+                continue;
+            };
+            if (val >= 3 and val <= 60) {
+                if (std.mem.eql(u8, key, "num")) {
+                    model.col_widths.num = val;
+                } else if (std.mem.eql(u8, key, "time")) {
+                    model.col_widths.time = val;
+                } else if (std.mem.eql(u8, key, "src")) {
+                    model.col_widths.src = val;
+                } else if (std.mem.eql(u8, key, "dst")) {
+                    model.col_widths.dst = val;
+                } else if (std.mem.eql(u8, key, "proto")) {
+                    model.col_widths.proto = val;
+                } else if (std.mem.eql(u8, key, "len")) {
+                    model.col_widths.len = val;
+                }
+            }
+        }
+        start = end + 1;
+    }
+}
+
+fn saveColumns(model: *const Model) void {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = columnsPath(&pbuf) orelse return;
+
+    const home = std.posix.getenv("HOME") orelse return;
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const config_dir = std.fmt.bufPrint(&dbuf, "{s}/.config", .{home}) catch return;
+    std.fs.makeDirAbsolute(config_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return,
+    };
+    const sniff_dir = std.fmt.bufPrint(&dbuf, "{s}/.config/sniff", .{home}) catch return;
+    std.fs.makeDirAbsolute(sniff_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return,
+    };
+
+    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer file.close();
+
+    const cw = model.col_widths;
+    var buf: [256]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "num={d}\ntime={d}\nsrc={d}\ndst={d}\nproto={d}\nlen={d}\n", .{
+        cw.num, cw.time, cw.src, cw.dst, cw.proto, cw.len,
+    }) catch return;
+    _ = file.write(s) catch {};
+}
+
+fn parseColumnSpec(spec: []const u8) ?ColumnWidths {
+    var cw: ColumnWidths = .{};
+    var has_any = false;
+    var iter = std.mem.splitScalar(u8, spec, ',');
+    while (iter.next()) |part| {
+        const sep = std.mem.indexOfScalar(u8, part, ':') orelse continue;
+        const key = part[0..sep];
+        const val = std.fmt.parseInt(u16, part[sep + 1 ..], 10) catch continue;
+        if (val < 3 or val > 60) continue;
+        has_any = true;
+        if (std.mem.eql(u8, key, "num")) {
+            cw.num = val;
+        } else if (std.mem.eql(u8, key, "time")) {
+            cw.time = val;
+        } else if (std.mem.eql(u8, key, "src")) {
+            cw.src = val;
+        } else if (std.mem.eql(u8, key, "dst")) {
+            cw.dst = val;
+        } else if (std.mem.eql(u8, key, "proto")) {
+            cw.proto = val;
+        } else if (std.mem.eql(u8, key, "len")) {
+            cw.len = val;
+        }
+    }
+    return if (has_any) cw else null;
 }
 
 fn applyExport(model: *Model) void {
@@ -838,6 +1036,14 @@ fn view(model: *Model, r: *P.Renderer) void {
         const cch: u21 = if (model.input_cursor < model.input_len) model.input_buf[model.input_cursor] else ' ';
         r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = t.text }, .fg = .{ .rgb = t.surface0 } });
         r.writeStyledText(help_row, cols -| 22, "enter:apply esc:cancel", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.overlay } });
+    } else if (model.col_resize) {
+        const hk_style: Style = .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.mauve }, .bold = true };
+        var col: u16 = 1;
+        r.writeStyledText(help_row, col, "COLUMNS ", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.peach }, .bold = true });
+        col += 8;
+        col = writeHelpKey(r, help_row, col, "left/right", "select", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "up/dn", "resize", help_style, hk_style);
+        _ = writeHelpKey(r, help_row, col, "esc", "done", help_style, hk_style);
     } else {
         const hk_style: Style = .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.mauve }, .bold = true };
         var col: u16 = 1;
@@ -854,6 +1060,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "P", "presets", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "T", "theme", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "F", "follow", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "c", "columns", help_style, hk_style);
         _ = writeHelpKey(r, help_row, col, "up/dn", "navigate", help_style, hk_style);
     }
 }
@@ -866,7 +1073,20 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     const dl_style: Style = .{ .fg = .{ .rgb = t.subtext } };
     const dv_style: Style = .{ .fg = .{ .rgb = t.text }, .bold = true };
 
-    writeColumns(r, 1, cols, "#", "Time", "Source", "Destination", "Proto", "Len", header_style);
+    const cw = model.col_widths;
+    if (model.col_resize) {
+        const hl_style: Style = .{ .fg = .{ .rgb = t.text }, .bg = .{ .rgb = t.overlay }, .bold = true };
+        var c: u16 = 0;
+        inline for (0..6) |ci| {
+            const idx: u3 = @intCast(ci);
+            const w = cw.colWidth(idx, cols);
+            const sty = if (model.col_selected == idx) hl_style else header_style;
+            writeField(r, 1, c, w, col_names[ci], sty);
+            c += w;
+        }
+    } else {
+        writeColumns(r, 1, cols, cw, "#", "Time", "Source", "Destination", "Proto", "Len", header_style);
+    }
     drawHLine(r, 2, cols, sep_style);
 
     const lh = listHeight(rows);
@@ -896,9 +1116,9 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             var len_buf: [8]u8 = undefined;
             const len_s = std.fmt.bufPrint(&len_buf, "{d}", .{pkt.length}) catch "";
 
-            writeColumns(r, row, cols, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protocol.name(), len_s, row_style);
+            writeColumns(r, row, cols, cw, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protocol.name(), len_s, row_style);
 
-            const pcol = protoCol(cols);
+            const pcol = protoCol(cw, cols);
             const pfg = protoColor(t, pkt.protocol);
             const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg }, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg } } else .{ .fg = .{ .rgb = pfg } };
             r.writeStyledText(row, pcol, pkt.protocol.name(), pstyle);
@@ -1539,11 +1759,8 @@ fn writeHelpKey(r: *P.Renderer, row: u16, col: u16, key: []const u8, desc: []con
     return after_key + @as(u16, @intCast(desc.len)) + 3;
 }
 
-fn protoCol(cols: u16) u16 {
-    const num_w: u16 = 6;
-    const time_w: u16 = 10;
-    const aw: u16 = addrWidth(cols);
-    return num_w + time_w + aw * 2;
+fn protoCol(cw: ColumnWidths, cols: u16) u16 {
+    return cw.num + cw.time + cw.srcWidth(cols) + cw.dstWidth(cols);
 }
 
 fn addrWidth(cols: u16) u16 {
@@ -1556,6 +1773,7 @@ fn writeColumns(
     r: *P.Renderer,
     row: u16,
     cols: u16,
+    cw: ColumnWidths,
     num: []const u8,
     time_str: []const u8,
     src: []const u8,
@@ -1564,22 +1782,20 @@ fn writeColumns(
     length: []const u8,
     sty: Style,
 ) void {
-    const num_w: u16 = 6;
-    const time_w: u16 = 10;
-    const aw: u16 = addrWidth(cols);
     var c: u16 = 0;
-
-    writeField(r, row, c, num_w, num, sty);
-    c += num_w;
-    writeField(r, row, c, time_w, time_str, sty);
-    c += time_w;
-    writeField(r, row, c, aw, src, sty);
-    c += aw;
-    writeField(r, row, c, aw, dst, sty);
-    c += aw;
-    writeField(r, row, c, 8, proto, sty);
-    c += 8;
-    writeField(r, row, c, 7, length, sty);
+    writeField(r, row, c, cw.num, num, sty);
+    c += cw.num;
+    writeField(r, row, c, cw.time, time_str, sty);
+    c += cw.time;
+    const sw = cw.srcWidth(cols);
+    writeField(r, row, c, sw, src, sty);
+    c += sw;
+    const dw = cw.dstWidth(cols);
+    writeField(r, row, c, dw, dst, sty);
+    c += dw;
+    writeField(r, row, c, cw.proto, proto, sty);
+    c += cw.proto;
+    writeField(r, row, c, cw.len, length, sty);
 }
 
 fn writeField(r: *P.Renderer, row: u16, col: u16, width: u16, text: []const u8, sty: Style) void {
@@ -1670,6 +1886,15 @@ pub fn main() !void {
                     }
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--columns")) {
+            ai += 1;
+            if (ai < argv.len) {
+                const spec = std.mem.span(argv[ai]);
+                if (parseColumnSpec(spec)) |cw| {
+                    initial_col_widths = cw;
+                    initial_col_widths_set = true;
+                }
+            }
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
             std.debug.print("sniff {s}\n", .{version});
             return;
@@ -1684,6 +1909,7 @@ pub fn main() !void {
                 \\  -l, --list         List available network interfaces
                 \\  -i <iface>         Capture on a specific interface
                 \\  --theme <name>     Color theme: dark (default), light
+                \\  --columns <spec>   Set column widths (e.g. num:8,src:24,dst:24)
                 \\  -V, --version      Show version
                 \\  -h, --help         Show this help
                 \\
