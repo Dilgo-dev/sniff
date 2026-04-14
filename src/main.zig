@@ -864,7 +864,7 @@ fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
         const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.dst_port}) catch "";
         if (containsSubstring(ps, term)) return true;
     }
-    if (containsSubstring(pkt.protocol.name(), term)) return true;
+    if (containsSubstring(pkt.protoLabel(), term)) return true;
     if (pkt.dns_name_len > 0 and containsSubstring(pkt.dnsName(), term)) return true;
     if (pkt.tls_sni_len > 0 and containsSubstring(pkt.sniName(), term)) return true;
     if (pkt.http_info_len > 0 and containsSubstring(pkt.httpInfo(), term)) return true;
@@ -939,7 +939,8 @@ fn adjustScroll(model: *Model) void {
     }
 }
 
-fn protoColor(t: Theme, proto: packet.Protocol) Rgb {
+fn protoColor(t: Theme, proto: packet.Protocol, quic: packet.QuicState) Rgb {
+    if (quic != .none) return t.peach;
     return switch (proto) {
         .tcp => t.green,
         .udp => t.blue,
@@ -1116,12 +1117,12 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             var len_buf: [8]u8 = undefined;
             const len_s = std.fmt.bufPrint(&len_buf, "{d}", .{pkt.length}) catch "";
 
-            writeColumns(r, row, cols, cw, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protocol.name(), len_s, row_style);
+            writeColumns(r, row, cols, cw, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protoLabel(), len_s, row_style);
 
             const pcol = protoCol(cw, cols);
-            const pfg = protoColor(t, pkt.protocol);
+            const pfg = protoColor(t, pkt.protocol, pkt.quic_state);
             const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg }, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg } } else .{ .fg = .{ .rgb = pfg } };
-            r.writeStyledText(row, pcol, pkt.protocol.name(), pstyle);
+            r.writeStyledText(row, pcol, pkt.protoLabel(), pstyle);
         } else {
             break;
         }
@@ -1154,11 +1155,20 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         }
 
         r.writeStyledText(d2, 1, "Proto: ", dl_style);
-        r.writeStyledText(d2, 8, pkt.protocol.name(), .{ .fg = .{ .rgb = protoColor(t, pkt.protocol) } });
+        const plabel = pkt.protoLabel();
+        r.writeStyledText(d2, 8, plabel, .{ .fg = .{ .rgb = protoColor(t, pkt.protocol, pkt.quic_state) } });
+        var detail_col: u16 = @intCast(8 + plabel.len);
+        if (pkt.quic_state != .none) {
+            const qlabel = pkt.quic_state.label();
+            r.writeStyledText(d2, detail_col, " ", dl_style);
+            detail_col += 1;
+            r.writeStyledText(d2, detail_col, qlabel, .{ .fg = .{ .rgb = t.peach }, .bold = true });
+            detail_col += @intCast(qlabel.len);
+        }
         {
             var lbuf: [32]u8 = undefined;
             const ls = std.fmt.bufPrint(&lbuf, "  Len: {d}", .{pkt.length}) catch "";
-            r.writeStyledText(d2, @intCast(8 + pkt.protocol.name().len), ls, dl_style);
+            r.writeStyledText(d2, detail_col, ls, dl_style);
         }
         if (pkt.ip_ttl > 0) {
             var tbuf: [16]u8 = undefined;
@@ -1683,7 +1693,7 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             pkt.src_port,
             pkt.dstAddr(),
             pkt.dst_port,
-            pkt.protocol.name(),
+            pkt.protoLabel(),
             pkt.raw_len,
         }) catch "";
         r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = t.text }, .bold = true });
@@ -1861,7 +1871,7 @@ fn writePacketJson(writer: anytype, pkt: *const packet.PacketInfo) !void {
     try writeJsonString(writer, pkt.dstAddr());
     try writer.print(",\"src_port\":{d},\"dst_port\":{d}", .{ pkt.src_port, pkt.dst_port });
     try writer.writeAll(",\"protocol\":");
-    try writeJsonString(writer, pkt.protocol.name());
+    try writeJsonString(writer, pkt.protoLabel());
     try writer.print(",\"length\":{d}", .{pkt.length});
     if (pkt.ip_ttl > 0) {
         try writer.print(",\"ttl\":{d}", .{pkt.ip_ttl});
@@ -1876,6 +1886,10 @@ fn writePacketJson(writer: anytype, pkt: *const packet.PacketInfo) !void {
         try writer.writeAll(",\"dns\":");
         try writeJsonString(writer, pkt.dnsName());
         try writer.print(",\"dns_response\":{}", .{pkt.dns_is_response});
+    }
+    if (pkt.quic_state != .none) {
+        try writer.writeAll(",\"quic_state\":");
+        try writeJsonString(writer, pkt.quic_state.label());
     }
     if (pkt.tls_sni_len > 0) {
         try writer.writeAll(",\"sni\":");

@@ -26,6 +26,39 @@ pub const Protocol = enum(u8) {
     }
 };
 
+pub const QuicState = enum(u8) {
+    none = 0,
+    initial = 1,
+    zero_rtt = 2,
+    handshake = 3,
+    retry = 4,
+    connected = 5,
+
+    /// Short label for the Protocol column (fits in 8 chars).
+    pub fn columnLabel(self: QuicState) []const u8 {
+        return switch (self) {
+            .none => "UDP",
+            .initial => "QUIC-I",
+            .zero_rtt => "QUIC-0R",
+            .handshake => "QUIC-HS",
+            .retry => "QUIC-R",
+            .connected => "QUIC",
+        };
+    }
+
+    /// Full label for the detail pane.
+    pub fn label(self: QuicState) []const u8 {
+        return switch (self) {
+            .none => "",
+            .initial => "Initial",
+            .zero_rtt => "0-RTT",
+            .handshake => "Handshake",
+            .retry => "Retry",
+            .connected => "Connected",
+        };
+    }
+};
+
 pub const snap_len = 1500;
 
 pub const PacketInfo = struct {
@@ -47,6 +80,7 @@ pub const PacketInfo = struct {
     http_info_len: u8 = 0,
     tls_sni: [253]u8 = .{0} ** 253,
     tls_sni_len: u8 = 0,
+    quic_state: QuicState = .none,
     raw: [snap_len]u8 = .{0} ** snap_len,
     raw_len: u16 = 0,
 
@@ -68,6 +102,12 @@ pub const PacketInfo = struct {
     /// HTTP request/response summary, if detected.
     pub fn httpInfo(self: *const PacketInfo) []const u8 {
         return self.http_info[0..self.http_info_len];
+    }
+
+    /// Protocol label for display, accounting for QUIC detection.
+    pub fn protoLabel(self: *const PacketInfo) []const u8 {
+        if (self.quic_state != .none) return self.quic_state.columnLabel();
+        return self.protocol.name();
     }
 
     /// TLS SNI hostname, if this is a TLS ClientHello with server_name.
@@ -167,6 +207,8 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
                 info.dst_port = readU16(data, 2);
                 if ((info.src_port == 53 or info.dst_port == 53) and data.len > 20) {
                     parseDns(data[8..], info);
+                } else if (data.len > 8) {
+                    parseQuic(data[8..], info);
                 }
             }
         },
@@ -311,6 +353,34 @@ fn extractSni(data: []const u8, info: *PacketInfo) void {
             return;
         }
         pos += name_len;
+    }
+}
+
+fn parseQuic(payload: []const u8, info: *PacketInfo) void {
+    if (payload.len < 5) return;
+    const first = payload[0];
+
+    if (first & 0x80 != 0) {
+        // Long header: fixed bit (0x40) must be set for QUIC v1/v2
+        if (first & 0x40 == 0) return;
+        if (payload.len < 6) return;
+        const version = @as(u32, payload[1]) << 24 | @as(u32, payload[2]) << 16 |
+            @as(u32, payload[3]) << 8 | @as(u32, payload[4]);
+        // QUIC v1 (RFC 9000) or v2 (RFC 9369)
+        if (version != 0x00000001 and version != 0x6B3343CF) return;
+        const ptype = (first & 0x30) >> 4;
+        info.quic_state = switch (ptype) {
+            0x00 => .initial,
+            0x01 => .zero_rtt,
+            0x02 => .handshake,
+            0x03 => .retry,
+            else => return,
+        };
+    } else {
+        // Short header (1-RTT): fixed bit must be set, common QUIC port
+        if (first & 0x40 == 0) return;
+        if (info.src_port != 443 and info.dst_port != 443) return;
+        info.quic_state = .connected;
     }
 }
 
@@ -768,4 +838,114 @@ test "fmtIpv6 compresses longest zero run" {
     bytes = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     len = fmtIpv6(&bytes, &out);
     try std.testing.expectEqualStrings("2001:db8:1::", out[0..len]);
+}
+
+test "detect QUIC Initial packet (v1 long header)" {
+    // Ethernet(14) + IPv4(20, proto=17) + UDP(8) + QUIC long header
+    const quic_payload = [_]u8{
+        0xC0, // Long header: 1 1 00 .... (Initial)
+        0x00, 0x00, 0x00, 0x01, // Version: QUIC v1
+        0x08, // DCID length
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // DCID
+        0x00, // SCID length
+    };
+    const header_len = 14 + 20 + 8;
+    var frame: [header_len + quic_payload.len]u8 = .{0} ** (header_len + quic_payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17; // UDP
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0xD4;
+    frame[35] = 0x31; // src port 54321
+    frame[36] = 0x01;
+    frame[37] = 0xBB; // dst port 443
+    @memcpy(frame[header_len..][0..quic_payload.len], &quic_payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(Protocol.udp, info.protocol);
+    try std.testing.expectEqual(QuicState.initial, info.quic_state);
+    try std.testing.expectEqualStrings("QUIC-I", info.protoLabel());
+}
+
+test "detect QUIC Handshake packet (v1 long header)" {
+    const quic_payload = [_]u8{
+        0xE0, // Long header: 1 1 10 .... (Handshake)
+        0x00, 0x00, 0x00, 0x01, // Version: QUIC v1
+        0x04, // DCID length
+        0xAA, 0xBB, 0xCC, 0xDD, // DCID
+        0x00, // SCID length
+    };
+    const header_len = 14 + 20 + 8;
+    var frame: [header_len + quic_payload.len]u8 = .{0} ** (header_len + quic_payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0x04;
+    frame[35] = 0xD2; // src port 1234
+    frame[36] = 0x01;
+    frame[37] = 0xBB; // dst port 443
+    @memcpy(frame[header_len..][0..quic_payload.len], &quic_payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(QuicState.handshake, info.quic_state);
+    try std.testing.expectEqualStrings("QUIC-HS", info.protoLabel());
+}
+
+test "detect QUIC short header as Connected on port 443" {
+    const quic_payload = [_]u8{
+        0x40, // Short header: 0 1 ...... (fixed bit set)
+        0x01, 0x02, 0x03, 0x04, // Packet data
+    };
+    const header_len = 14 + 20 + 8;
+    var frame: [header_len + quic_payload.len]u8 = .{0} ** (header_len + quic_payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0xD4;
+    frame[35] = 0x31; // src port 54321
+    frame[36] = 0x01;
+    frame[37] = 0xBB; // dst port 443
+    @memcpy(frame[header_len..][0..quic_payload.len], &quic_payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(QuicState.connected, info.quic_state);
+    try std.testing.expectEqualStrings("QUIC", info.protoLabel());
+}
+
+test "non-QUIC UDP does not set quic_state" {
+    var frame: [50]u8 = .{0} ** 50;
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0x04;
+    frame[35] = 0xD2; // src port 1234
+    frame[36] = 0x13;
+    frame[37] = 0x88; // dst port 5000
+    // Random payload, not QUIC
+    frame[42] = 0x00;
+    frame[43] = 0x01;
+    frame[44] = 0x02;
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(QuicState.none, info.quic_state);
+    try std.testing.expectEqualStrings("UDP", info.protoLabel());
 }
