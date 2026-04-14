@@ -59,6 +59,24 @@ pub const QuicState = enum(u8) {
     }
 };
 
+pub const AppProto = enum(u8) {
+    none = 0,
+    mdns = 1,
+    dhcp = 2,
+    ntp = 3,
+    ssh = 4,
+
+    pub fn label(self: AppProto) []const u8 {
+        return switch (self) {
+            .none => "",
+            .mdns => "mDNS",
+            .dhcp => "DHCP",
+            .ntp => "NTP",
+            .ssh => "SSH",
+        };
+    }
+};
+
 pub const snap_len = 1500;
 
 pub const PacketInfo = struct {
@@ -81,6 +99,7 @@ pub const PacketInfo = struct {
     tls_sni: [253]u8 = .{0} ** 253,
     tls_sni_len: u8 = 0,
     quic_state: QuicState = .none,
+    app_proto: AppProto = .none,
     raw: [snap_len]u8 = .{0} ** snap_len,
     raw_len: u16 = 0,
 
@@ -104,8 +123,9 @@ pub const PacketInfo = struct {
         return self.http_info[0..self.http_info_len];
     }
 
-    /// Protocol label for display, accounting for QUIC detection.
+    /// Protocol label for display, accounting for app-layer detection.
     pub fn protoLabel(self: *const PacketInfo) []const u8 {
+        if (self.app_proto != .none) return self.app_proto.label();
         if (self.quic_state != .none) return self.quic_state.columnLabel();
         return self.protocol.name();
     }
@@ -193,9 +213,14 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
                 const data_off: usize = @as(usize, data[12] >> 4) * 4;
                 if (data_off >= 20 and data.len > data_off) {
                     const payload = data[data_off..];
-                    parseHttp(payload, info);
-                    if (info.http_info_len == 0) {
-                        parseTlsSni(payload, info);
+                    if (payload.len >= 4 and std.mem.eql(u8, payload[0..4], "SSH-")) {
+                        info.app_proto = .ssh;
+                        setHttpInfo(info, firstLine(payload));
+                    } else {
+                        parseHttp(payload, info);
+                        if (info.http_info_len == 0) {
+                            parseTlsSni(payload, info);
+                        }
                     }
                 }
             }
@@ -205,8 +230,17 @@ fn parseTransport(proto: u8, data: []const u8, info: *PacketInfo) void {
             if (data.len >= 4) {
                 info.src_port = readU16(data, 0);
                 info.dst_port = readU16(data, 2);
-                if ((info.src_port == 53 or info.dst_port == 53) and data.len > 20) {
+                if (info.src_port == 5353 or info.dst_port == 5353) {
+                    info.app_proto = .mdns;
+                    if (data.len > 20) parseDns(data[8..], info);
+                } else if ((info.src_port == 53 or info.dst_port == 53) and data.len > 20) {
                     parseDns(data[8..], info);
+                } else if (info.src_port == 67 or info.dst_port == 67 or
+                    info.src_port == 68 or info.dst_port == 68)
+                {
+                    info.app_proto = .dhcp;
+                } else if (info.src_port == 123 or info.dst_port == 123) {
+                    info.app_proto = .ntp;
                 } else if (data.len > 8) {
                     parseQuic(data[8..], info);
                 }
@@ -948,4 +982,91 @@ test "non-QUIC UDP does not set quic_state" {
     const info = parse(&frame).?;
     try std.testing.expectEqual(QuicState.none, info.quic_state);
     try std.testing.expectEqualStrings("UDP", info.protoLabel());
+}
+
+test "detect mDNS on UDP port 5353" {
+    var frame: [60]u8 = .{0} ** 60;
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17; // UDP
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 224;
+    frame[33] = 251; // 224.0.0.251
+    frame[34] = 0x14;
+    frame[35] = 0xE9; // src port 5353
+    frame[36] = 0x14;
+    frame[37] = 0xE9; // dst port 5353
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(AppProto.mdns, info.app_proto);
+    try std.testing.expectEqualStrings("mDNS", info.protoLabel());
+}
+
+test "detect DHCP on UDP port 67" {
+    var frame: [50]u8 = .{0} ** 50;
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[26] = 0;
+    frame[29] = 0; // 0.0.0.0
+    frame[30] = 255;
+    frame[31] = 255;
+    frame[32] = 255;
+    frame[33] = 255; // 255.255.255.255
+    frame[34] = 0x00;
+    frame[35] = 0x44; // src port 68
+    frame[36] = 0x00;
+    frame[37] = 0x43; // dst port 67
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(AppProto.dhcp, info.app_proto);
+    try std.testing.expectEqualStrings("DHCP", info.protoLabel());
+}
+
+test "detect NTP on UDP port 123" {
+    var frame: [50]u8 = .{0} ** 50;
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 17;
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0xC0;
+    frame[35] = 0x00; // src port 49152
+    frame[36] = 0x00;
+    frame[37] = 0x7B; // dst port 123
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(AppProto.ntp, info.app_proto);
+    try std.testing.expectEqualStrings("NTP", info.protoLabel());
+}
+
+test "detect SSH banner in TCP payload" {
+    const ssh_payload = "SSH-2.0-OpenSSH_9.6\r\n";
+    const header_len = 14 + 20 + 20;
+    var frame: [header_len + ssh_payload.len]u8 = .{0} ** (header_len + ssh_payload.len);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[23] = 6; // TCP
+    frame[26] = 10;
+    frame[29] = 1;
+    frame[30] = 10;
+    frame[33] = 2;
+    frame[34] = 0x00;
+    frame[35] = 0x16; // src port 22
+    frame[36] = 0xD4;
+    frame[37] = 0x31; // dst port 54321
+    frame[46] = 0x50; // data offset 5
+    @memcpy(frame[header_len..], ssh_payload);
+
+    const info = parse(&frame).?;
+    try std.testing.expectEqual(AppProto.ssh, info.app_proto);
+    try std.testing.expectEqualStrings("SSH", info.protoLabel());
+    try std.testing.expectEqualStrings("SSH-2.0-OpenSSH_9.6", info.httpInfo());
 }

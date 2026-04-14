@@ -939,9 +939,16 @@ fn adjustScroll(model: *Model) void {
     }
 }
 
-fn protoColor(t: Theme, proto: packet.Protocol, quic: packet.QuicState) Rgb {
-    if (quic != .none) return t.peach;
-    return switch (proto) {
+fn protoColor(t: Theme, pkt: *const packet.PacketInfo) Rgb {
+    if (pkt.app_proto != .none) return switch (pkt.app_proto) {
+        .mdns => t.yellow,
+        .dhcp => t.peach,
+        .ntp => t.blue,
+        .ssh => t.green,
+        .none => unreachable,
+    };
+    if (pkt.quic_state != .none) return t.peach;
+    return switch (pkt.protocol) {
         .tcp => t.green,
         .udp => t.blue,
         .icmp, .icmp6 => t.yellow,
@@ -1120,7 +1127,7 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             writeColumns(r, row, cols, cw, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protoLabel(), len_s, row_style);
 
             const pcol = protoCol(cw, cols);
-            const pfg = protoColor(t, pkt.protocol, pkt.quic_state);
+            const pfg = protoColor(t, &pkt);
             const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg }, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg } } else .{ .fg = .{ .rgb = pfg } };
             r.writeStyledText(row, pcol, pkt.protoLabel(), pstyle);
         } else {
@@ -1156,7 +1163,7 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
 
         r.writeStyledText(d2, 1, "Proto: ", dl_style);
         const plabel = pkt.protoLabel();
-        r.writeStyledText(d2, 8, plabel, .{ .fg = .{ .rgb = protoColor(t, pkt.protocol, pkt.quic_state) } });
+        r.writeStyledText(d2, 8, plabel, .{ .fg = .{ .rgb = protoColor(t, &pkt) } });
         var detail_col: u16 = @intCast(8 + plabel.len);
         if (pkt.quic_state != .none) {
             const qlabel = pkt.quic_state.label();
