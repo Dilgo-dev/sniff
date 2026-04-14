@@ -71,3 +71,23 @@ pub fn exportPackets(
 
     return count;
 }
+
+/// Write pcap global header to an open file (for streaming capture).
+pub fn writeGlobalHeader(file: std.fs.File) std.fs.File.WriteError!void {
+    const ghdr: GlobalHeader = .{};
+    try file.writeAll(std.mem.asBytes(&ghdr));
+}
+
+/// Append a single packet record to an open pcap file.
+pub fn writePacketRecord(file: std.fs.File, pkt: *const packet.PacketInfo) std.fs.File.WriteError!void {
+    if (pkt.raw_len == 0) return;
+    const ts_ms: u64 = @intCast(pkt.timestamp_ms);
+    const phdr: PacketHeader = .{
+        .ts_sec = @intCast(ts_ms / 1000),
+        .ts_usec = @intCast((ts_ms % 1000) * 1000),
+        .incl_len = pkt.raw_len,
+        .orig_len = pkt.length,
+    };
+    try file.writeAll(std.mem.asBytes(&phdr));
+    try file.writeAll(pkt.raw[0..pkt.raw_len]);
+}

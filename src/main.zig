@@ -1903,6 +1903,44 @@ fn runJsonMode(handle: capture.CaptureHandle) void {
     }
 }
 
+fn runPcapMode(handle: capture.CaptureHandle, path: []const u8) void {
+    var path_buf: [256]u8 = undefined;
+    if (path.len >= path_buf.len) {
+        std.debug.print("error: output path too long\n", .{});
+        return;
+    }
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+
+    const file = std.fs.cwd().createFile(path_buf[0..path.len :0], .{}) catch {
+        std.debug.print("error: cannot create {s}\n", .{path});
+        return;
+    };
+    defer file.close();
+
+    pcap.writeGlobalHeader(file) catch {
+        std.debug.print("error: failed to write pcap header\n", .{});
+        return;
+    };
+
+    var cap_buf: [65536]u8 = undefined;
+    var count: usize = 0;
+    while (true) {
+        const frame = capture.readOne(handle, &cap_buf) catch continue;
+        if (frame.len < 14) continue;
+        var info = packet.parse(frame) orelse continue;
+        info.timestamp_ms = std.time.milliTimestamp();
+        const snap = @min(frame.len, packet.snap_len);
+        @memcpy(info.raw[0..snap], frame[0..snap]);
+        info.raw_len = @intCast(snap);
+        pcap.writePacketRecord(file, &info) catch {
+            std.debug.print("error: write failed after {d} packets\n", .{count});
+            return;
+        };
+        count += 1;
+    }
+}
+
 fn runUpdate() !void {
     std.debug.print("sniff update - checking for latest release...\n", .{});
     if (builtin.os.tag == .windows) {
@@ -1934,6 +1972,8 @@ pub fn main() !void {
     var iface_arg: ?[]const u8 = null;
     var list_mode = false;
     var json_mode = false;
+    var no_tui = false;
+    var write_path: ?[]const u8 = null;
 
     const argv = std.os.argv;
     var ai: usize = 1;
@@ -1961,6 +2001,13 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_mode = true;
+        } else if (std.mem.eql(u8, arg, "--no-tui")) {
+            no_tui = true;
+        } else if (std.mem.eql(u8, arg, "-w")) {
+            ai += 1;
+            if (ai < argv.len) {
+                write_path = std.mem.span(argv[ai]);
+            }
         } else if (std.mem.eql(u8, arg, "--columns")) {
             ai += 1;
             if (ai < argv.len) {
@@ -1986,6 +2033,8 @@ pub fn main() !void {
                 \\  --theme <name>     Color theme: dark (default), light
                 \\  --columns <spec>   Set column widths (e.g. num:8,src:24,dst:24)
                 \\  --json             Stream packets as NDJSON to stdout (no TUI)
+                \\  --no-tui           Capture without TUI (NDJSON to stdout, or pcap with -w)
+                \\  -w <file>          Write captured packets to a pcap file (with --no-tui)
                 \\  -V, --version      Show version
                 \\  -h, --help         Show this help
                 \\
@@ -2034,8 +2083,12 @@ pub fn main() !void {
     };
     defer capture.close(capture_handle.?);
 
-    if (json_mode) {
-        runJsonMode(capture_handle.?);
+    if (json_mode or no_tui) {
+        if (write_path) |path| {
+            runPcapMode(capture_handle.?, path);
+        } else {
+            runJsonMode(capture_handle.?);
+        }
         return;
     }
 
