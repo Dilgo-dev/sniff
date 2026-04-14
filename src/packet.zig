@@ -106,6 +106,9 @@ pub const PacketInfo = struct {
     tls_cert_expiry_len: u8 = 0,
     quic_state: QuicState = .none,
     app_proto: AppProto = .none,
+    proc_pid: u32 = 0,
+    proc_name: [16]u8 = .{0} ** 16,
+    proc_name_len: u8 = 0,
     raw: [snap_len]u8 = .{0} ** snap_len,
     raw_len: u16 = 0,
 
@@ -154,6 +157,11 @@ pub const PacketInfo = struct {
     /// Expiration date (notAfter) from the server certificate.
     pub fn certExpiry(self: *const PacketInfo) []const u8 {
         return self.tls_cert_expiry[0..self.tls_cert_expiry_len];
+    }
+
+    /// Owning process name, if attribution was performed.
+    pub fn procName(self: *const PacketInfo) []const u8 {
+        return self.proc_name[0..self.proc_name_len];
     }
 
     /// Format TCP flags into a human-readable string.

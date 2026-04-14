@@ -10,6 +10,7 @@ const packet = @import("packet.zig");
 const capture = @import("capture.zig");
 const filter_mod = @import("filter.zig");
 const pcap = @import("pcap.zig");
+const proc = @import("proc.zig");
 
 const Style = glym.style.Style;
 const Rgb = glym.style.Rgb;
@@ -69,6 +70,7 @@ var initial_col_widths_set: bool = false;
 
 // Module-level so async_task capture functions can access it.
 var capture_handle: ?capture.CaptureHandle = null;
+var proc_table: proc.ProcTable = .{};
 
 fn captureOne(_: std.mem.Allocator) anyerror!?App {
     const handle = capture_handle orelse return null;
@@ -80,6 +82,18 @@ fn captureOne(_: std.mem.Allocator) anyerror!?App {
     const snap = @min(frame.len, packet.snap_len);
     @memcpy(info.raw[0..snap], frame[0..snap]);
     info.raw_len = @intCast(snap);
+    if (comptime builtin.os.tag == .linux) {
+        const now = info.timestamp_ms;
+        if (now - proc_table.last_refresh > 2000) {
+            proc_table.refresh();
+        }
+        if (proc_table.lookup(&info)) |p| {
+            info.proc_pid = p.pid;
+            const n = @min(p.name.len, 16);
+            @memcpy(info.proc_name[0..n], p.name[0..n]);
+            info.proc_name_len = @intCast(n);
+        }
+    }
     return .{ .captured = info };
 }
 
@@ -1186,6 +1200,12 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             const ps2 = std.fmt.bufPrint(&pbuf2, ":{d}", .{pkt.dst_port}) catch "";
             r.writeStyledText(d1, @intCast(dst_col + 5 + pkt.dstAddr().len), ps2, dv_style);
         }
+        if (pkt.proc_name_len > 0) {
+            var proc_buf: [32]u8 = undefined;
+            const proc_s = std.fmt.bufPrint(&proc_buf, "  [{s}/{d}]", .{ pkt.procName(), pkt.proc_pid }) catch "";
+            const proc_col: u16 = if (cols > proc_s.len + 2) cols - @as(u16, @intCast(proc_s.len)) - 1 else 1;
+            r.writeStyledText(d1, proc_col, proc_s, .{ .fg = .{ .rgb = t.green } });
+        }
 
         r.writeStyledText(d2, 1, "Proto: ", dl_style);
         const plabel = pkt.protoLabel();
@@ -1964,6 +1984,11 @@ fn writePacketJson(writer: anytype, pkt: *const packet.PacketInfo) !void {
         try writer.writeAll(",\"http\":");
         try writeJsonString(writer, pkt.httpInfo());
     }
+    if (pkt.proc_pid > 0) {
+        try writer.writeAll(",\"proc_name\":");
+        try writeJsonString(writer, pkt.procName());
+        try writer.print(",\"proc_pid\":{d}", .{pkt.proc_pid});
+    }
     try writer.writeAll("}\n");
 }
 
@@ -1971,11 +1996,23 @@ fn runJsonMode(handle: capture.CaptureHandle) void {
     const stdout = std.fs.File.stdout();
     var cap_buf: [65536]u8 = undefined;
     var out_buf: [4096]u8 = undefined;
+    var json_proc_table: proc.ProcTable = .{};
     while (true) {
         const frame = capture.readOne(handle, &cap_buf) catch continue;
         if (frame.len < 14) continue;
         var info = packet.parse(frame) orelse continue;
         info.timestamp_ms = std.time.milliTimestamp();
+        if (comptime builtin.os.tag == .linux) {
+            if (info.timestamp_ms - json_proc_table.last_refresh > 2000) {
+                json_proc_table.refresh();
+            }
+            if (json_proc_table.lookup(&info)) |p| {
+                info.proc_pid = p.pid;
+                const n = @min(p.name.len, 16);
+                @memcpy(info.proc_name[0..n], p.name[0..n]);
+                info.proc_name_len = @intCast(n);
+            }
+        }
         var fbs = std.io.fixedBufferStream(&out_buf);
         writePacketJson(fbs.writer(), &info) catch continue;
         stdout.writeAll(fbs.getWritten()) catch return;

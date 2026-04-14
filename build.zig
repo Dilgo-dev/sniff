@@ -45,4 +45,12 @@ pub fn build(b: *std.Build) void {
     });
     const filter_tests = b.addTest(.{ .root_module = filter_test_mod });
     test_step.dependOn(&b.addRunArtifact(filter_tests).step);
+
+    const proc_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/proc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const proc_tests = b.addTest(.{ .root_module = proc_test_mod });
+    test_step.dependOn(&b.addRunArtifact(proc_tests).step);
 }
