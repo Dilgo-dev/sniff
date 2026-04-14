@@ -133,18 +133,34 @@ const Model = struct {
     status_buf: [64]u8 = .{0} ** 64,
     status_len: u8 = 0,
     status_time: i64 = 0,
+    preset_view: bool = false,
+    preset_selected: u8 = 0,
+    presets: [max_presets]Preset = [_]Preset{.{}} ** max_presets,
+    preset_count: u8 = 0,
 
     fn th(self: *const Model) Theme {
         return themes[self.theme_idx % themes.len];
     }
 };
 
+const Preset = struct {
+    buf: [128]u8 = .{0} ** 128,
+    len: u8 = 0,
+
+    fn slice(self: *const Preset) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 const version = "0.1.0";
 const max_packets = 50000;
 const max_bw_samples = 300; // 5 minutes of per-second data
+const max_presets = 20;
 
 fn init(_: std.mem.Allocator) anyerror!Model {
-    return .{ .start_time = std.time.milliTimestamp(), .theme_idx = initial_theme_idx };
+    var model: Model = .{ .start_time = std.time.milliTimestamp(), .theme_idx = initial_theme_idx };
+    loadPresets(&model);
+    return model;
 }
 
 fn deinit(model: *Model, _: std.mem.Allocator) void {
@@ -158,7 +174,9 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
             model.cols = sz.cols;
         },
         .key => |k| {
-            if (model.input_mode != .none) {
+            if (model.preset_view) {
+                handlePresetKey(model, k);
+            } else if (model.input_mode != .none) {
                 handleTextInput(model, k);
             } else {
                 switch (handleKey(model, k)) {
@@ -275,6 +293,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 'N') searchNext(model, false);
             if (c == 'F') model.follow = !model.follow;
             if (c == 'T') model.theme_idx = @intCast((model.theme_idx + 1) % themes.len);
+            if (c == 'P') model.preset_view = !model.preset_view;
         },
         .arrow_up => {
             if (model.hex_view or model.stream_view) {
@@ -474,6 +493,119 @@ fn applyFilter(model: *Model) void {
     }
     model.selected = 0;
     model.scroll = 0;
+}
+
+fn handlePresetKey(model: *Model, k: glym.input.Key) void {
+    switch (k.code) {
+        .escape => model.preset_view = false,
+        .enter => {
+            if (model.preset_count > 0 and model.preset_selected < model.preset_count) {
+                const preset = model.presets[model.preset_selected].slice();
+                @memcpy(model.input_buf[0..preset.len], preset);
+                model.input_len = @intCast(preset.len);
+                model.input_cursor = model.input_len;
+                applyFilter(model);
+                model.preset_view = false;
+            }
+        },
+        .arrow_up => {
+            if (model.preset_selected > 0) model.preset_selected -= 1;
+        },
+        .arrow_down => {
+            if (model.preset_selected + 1 < model.preset_count) model.preset_selected += 1;
+        },
+        .char => |c| {
+            if (c == 'a') {
+                if (model.filter_len > 0 and model.preset_count < max_presets) {
+                    const expr = model.filter_buf[0..model.filter_len];
+                    // Avoid duplicates
+                    for (model.presets[0..model.preset_count]) |*p| {
+                        if (std.mem.eql(u8, p.slice(), expr)) return;
+                    }
+                    var p = &model.presets[model.preset_count];
+                    @memcpy(p.buf[0..expr.len], expr);
+                    p.len = @intCast(expr.len);
+                    model.preset_count += 1;
+                    savePresets(model);
+                    setStatus(model, "Preset saved");
+                }
+            }
+            if (c == 'd') {
+                if (model.preset_count > 0 and model.preset_selected < model.preset_count) {
+                    var i: usize = model.preset_selected;
+                    while (i + 1 < model.preset_count) : (i += 1) {
+                        model.presets[i] = model.presets[i + 1];
+                    }
+                    model.presets[model.preset_count - 1] = .{};
+                    model.preset_count -= 1;
+                    if (model.preset_selected >= model.preset_count and model.preset_selected > 0)
+                        model.preset_selected -= 1;
+                    savePresets(model);
+                    setStatus(model, "Preset deleted");
+                }
+            }
+            if (c == 'q') model.preset_view = false;
+        },
+        else => {},
+    }
+}
+
+fn presetsPath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const home = std.posix.getenv("HOME") orelse return null;
+    const s = std.fmt.bufPrint(buf, "{s}/.config/sniff/presets.txt", .{home}) catch return null;
+    return s;
+}
+
+fn loadPresets(model: *Model) void {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = presetsPath(&pbuf) orelse return;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return;
+    defer file.close();
+
+    var rbuf: [128 * max_presets]u8 = undefined;
+    const n = file.readAll(&rbuf) catch return;
+    const data = rbuf[0..n];
+
+    var start: usize = 0;
+    while (start < data.len and model.preset_count < max_presets) {
+        var end = start;
+        while (end < data.len and data[end] != '\n') : (end += 1) {}
+        const line = data[start..end];
+        if (line.len > 0 and line.len <= 128) {
+            var p = &model.presets[model.preset_count];
+            @memcpy(p.buf[0..line.len], line);
+            p.len = @intCast(line.len);
+            model.preset_count += 1;
+        }
+        start = end + 1;
+    }
+}
+
+fn savePresets(model: *const Model) void {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = presetsPath(&pbuf) orelse return;
+
+    // Ensure ~/.config and ~/.config/sniff exist
+    const home = std.posix.getenv("HOME") orelse return;
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const config_dir = std.fmt.bufPrint(&dbuf, "{s}/.config", .{home}) catch return;
+    std.fs.makeDirAbsolute(config_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return,
+    };
+    const sniff_dir = std.fmt.bufPrint(&dbuf, "{s}/.config/sniff", .{home}) catch return;
+    std.fs.makeDirAbsolute(sniff_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return,
+    };
+
+    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer file.close();
+
+    for (model.presets[0..model.preset_count]) |*p| {
+        _ = file.write(p.slice()) catch return;
+        _ = file.write("\n") catch return;
+    }
 }
 
 fn applyExport(model: *Model) void {
@@ -677,6 +809,10 @@ fn view(model: *Model, r: *P.Renderer) void {
         viewPacketList(model, r, rows, cols);
     }
 
+    if (model.preset_view) {
+        viewPresets(model, r, rows, cols, t);
+    }
+
     const help_style: Style = .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.subtext } };
     const help_row: u16 = rows - 1;
     r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
@@ -715,6 +851,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "s", "stats", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "b", "graph", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "w", "export", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "P", "presets", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "T", "theme", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "F", "follow", help_style, hk_style);
         _ = writeHelpKey(r, help_row, col, "up/dn", "navigate", help_style, hk_style);
@@ -1267,6 +1404,47 @@ fn fmtBytes(bytes: u64, buf: *[16]u8) []const u8 {
         return std.fmt.bufPrint(buf, "{d}.{d} KB", .{ bytes / 1024, (bytes / 100) % 10 }) catch "";
     } else {
         return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
+    }
+}
+
+fn viewPresets(model: *Model, r: *P.Renderer, rows: u16, cols: u16, t: Theme) void {
+    const box_w: u16 = @min(cols -| 4, 60);
+    const box_h: u16 = @min(rows -| 6, @as(u16, model.preset_count) + 4);
+    if (box_w < 20 or box_h < 4) return;
+
+    const x0: u16 = (cols -| box_w) / 2;
+    const y0: u16 = (rows -| box_h) / 2;
+
+    const bg: Style = .{ .bg = .{ .rgb = t.surface1 } };
+    r.fillRect(y0, x0, box_h, box_w, .{ .char = ' ', .style = bg });
+
+    const title_s: Style = .{ .bg = .{ .rgb = t.surface1 }, .fg = .{ .rgb = t.text }, .bold = true };
+    r.writeStyledText(y0, x0 + 2, "Filter Presets", title_s);
+
+    const hint_s: Style = .{ .bg = .{ .rgb = t.surface1 }, .fg = .{ .rgb = t.overlay } };
+    r.writeStyledText(y0 + 1, x0 + 2, "enter:apply a:save d:delete esc:close", hint_s);
+
+    if (model.preset_count == 0) {
+        const empty_s: Style = .{ .bg = .{ .rgb = t.surface1 }, .fg = .{ .rgb = t.subtext } };
+        r.writeStyledText(y0 + 3, x0 + 2, "No presets saved. Use 'a' to save current filter.", empty_s);
+        return;
+    }
+
+    var i: u8 = 0;
+    while (i < model.preset_count) : (i += 1) {
+        const row: u16 = y0 + 3 + i;
+        if (row >= y0 + box_h - 1) break;
+        const is_sel = i == model.preset_selected;
+        const sty: Style = if (is_sel)
+            .{ .bg = .{ .rgb = t.mauve }, .fg = .{ .rgb = t.surface0 }, .bold = true }
+        else
+            .{ .bg = .{ .rgb = t.surface1 }, .fg = .{ .rgb = t.text } };
+        if (is_sel) {
+            r.fillRect(row, x0 + 1, 1, box_w - 2, .{ .char = ' ', .style = sty });
+        }
+        const expr = model.presets[i].slice();
+        const show = @min(expr.len, @as(usize, box_w) -| 4);
+        r.writeStyledText(row, x0 + 2, expr[0..show], sty);
     }
 }
 
