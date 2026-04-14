@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .glym = .{
-            .url = "git+https://github.com/glymmi/glym#495658ad486d26a3bd78d2cd8113394ad65eda6e",
-            .hash = "glym-0.0.1-rW-8WJ-RAQD11Aa-S2m5yy5jRZ6ZLKS0eg0B1GufuXqm",
+            .url = "git+https://github.com/glymmi/glym#6e73a06d27078e277f015bd4066e4042372cf098",
+            .hash = "glym-0.0.1-rW-8WLujAQBfCB_J8-cwO-_IaGwtdu5t4iTla7qymD85",
         },
     },
     .paths = .{

@@ -111,6 +111,7 @@ fn update(model: *Model, m: P.Msg) P.Cmd {
                 }
             }
         },
+        .mouse => |me| handleMouse(model, me),
         .app => |a| switch (a) {
             .captured => |pkt| {
                 if (!model.paused) {
@@ -279,6 +280,55 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
         else => {},
     }
     return .none;
+}
+
+fn handleMouse(model: *Model, me: glym.input.MouseEvent) void {
+    const mouse = glym.input.MouseButton;
+    switch (me.button) {
+        mouse.scroll_up => {
+            if (model.hex_view and model.hex_scroll > 0) {
+                model.hex_scroll -= 1;
+            } else if (model.stream_view and model.stream_scroll > 0) {
+                model.stream_scroll -= 1;
+            } else if (!model.hex_view and !model.stream_view and !model.stats_view and !model.graph_view) {
+                if (model.selected > 0) {
+                    model.follow = false;
+                    model.selected -= 1;
+                    adjustScroll(model);
+                }
+            }
+        },
+        mouse.scroll_down => {
+            if (model.hex_view) {
+                model.hex_scroll += 1;
+            } else if (model.stream_view) {
+                model.stream_scroll += 1;
+            } else if (!model.stats_view and !model.graph_view) {
+                const count = visibleCount(model);
+                if (count > 0 and model.selected < count - 1) {
+                    model.follow = false;
+                    model.selected += 1;
+                    adjustScroll(model);
+                }
+            }
+        },
+        mouse.left => {
+            if (!me.pressed) return;
+            if (model.hex_view or model.stream_view or model.stats_view or model.graph_view) return;
+            // Packet list rows start at screen row 3 (0-indexed)
+            if (me.row < 3) return;
+            const row_offset = @as(usize, me.row) - 3;
+            const lh = listHeight(model.rows);
+            if (row_offset >= lh) return;
+            const pkt_idx = model.scroll + row_offset;
+            const count = visibleCount(model);
+            if (pkt_idx < count) {
+                model.follow = false;
+                model.selected = pkt_idx;
+            }
+        },
+        else => {},
+    }
 }
 
 fn openInput(model: *Model, mode: InputMode) void {
