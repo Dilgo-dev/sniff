@@ -1831,6 +1831,78 @@ fn activeIfaceSlice() []const u8 {
     return active_iface[0..active_iface_len];
 }
 
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{d:0>4}", .{@as(u16, c)});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writePacketJson(writer: anytype, pkt: *const packet.PacketInfo) !void {
+    try writer.writeAll("{\"timestamp_ms\":");
+    try writer.print("{d}", .{pkt.timestamp_ms});
+    try writer.writeAll(",\"src\":");
+    try writeJsonString(writer, pkt.srcAddr());
+    try writer.writeAll(",\"dst\":");
+    try writeJsonString(writer, pkt.dstAddr());
+    try writer.print(",\"src_port\":{d},\"dst_port\":{d}", .{ pkt.src_port, pkt.dst_port });
+    try writer.writeAll(",\"protocol\":");
+    try writeJsonString(writer, pkt.protocol.name());
+    try writer.print(",\"length\":{d}", .{pkt.length});
+    if (pkt.ip_ttl > 0) {
+        try writer.print(",\"ttl\":{d}", .{pkt.ip_ttl});
+    }
+    if (pkt.protocol == .tcp and pkt.tcp_flags > 0) {
+        var fbuf: [40]u8 = undefined;
+        const flags = pkt.tcpFlagsStr(&fbuf);
+        try writer.writeAll(",\"tcp_flags\":");
+        try writeJsonString(writer, flags);
+    }
+    if (pkt.dns_name_len > 0) {
+        try writer.writeAll(",\"dns\":");
+        try writeJsonString(writer, pkt.dnsName());
+        try writer.print(",\"dns_response\":{}", .{pkt.dns_is_response});
+    }
+    if (pkt.tls_sni_len > 0) {
+        try writer.writeAll(",\"sni\":");
+        try writeJsonString(writer, pkt.sniName());
+    }
+    if (pkt.http_info_len > 0) {
+        try writer.writeAll(",\"http\":");
+        try writeJsonString(writer, pkt.httpInfo());
+    }
+    try writer.writeAll("}\n");
+}
+
+fn runJsonMode(handle: capture.CaptureHandle) void {
+    const stdout = std.fs.File.stdout();
+    var cap_buf: [65536]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    while (true) {
+        const frame = capture.readOne(handle, &cap_buf) catch continue;
+        if (frame.len < 14) continue;
+        var info = packet.parse(frame) orelse continue;
+        info.timestamp_ms = std.time.milliTimestamp();
+        var fbs = std.io.fixedBufferStream(&out_buf);
+        writePacketJson(fbs.writer(), &info) catch continue;
+        stdout.writeAll(fbs.getWritten()) catch return;
+    }
+}
+
 fn runUpdate() !void {
     std.debug.print("sniff update - checking for latest release...\n", .{});
     if (builtin.os.tag == .windows) {
@@ -1861,6 +1933,7 @@ fn runUpdate() !void {
 pub fn main() !void {
     var iface_arg: ?[]const u8 = null;
     var list_mode = false;
+    var json_mode = false;
 
     const argv = std.os.argv;
     var ai: usize = 1;
@@ -1886,6 +1959,8 @@ pub fn main() !void {
                     }
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json_mode = true;
         } else if (std.mem.eql(u8, arg, "--columns")) {
             ai += 1;
             if (ai < argv.len) {
@@ -1910,6 +1985,7 @@ pub fn main() !void {
                 \\  -i <iface>         Capture on a specific interface
                 \\  --theme <name>     Color theme: dark (default), light
                 \\  --columns <spec>   Set column widths (e.g. num:8,src:24,dst:24)
+                \\  --json             Stream packets as NDJSON to stdout (no TUI)
                 \\  -V, --version      Show version
                 \\  -h, --help         Show this help
                 \\
@@ -1957,6 +2033,11 @@ pub fn main() !void {
         std.process.exit(1);
     };
     defer capture.close(capture_handle.?);
+
+    if (json_mode) {
+        runJsonMode(capture_handle.?);
+        return;
+    }
 
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
