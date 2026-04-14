@@ -14,6 +14,57 @@ const pcap = @import("pcap.zig");
 const Style = glym.style.Style;
 const Rgb = glym.style.Rgb;
 
+const Theme = struct {
+    name: []const u8,
+    surface0: Rgb,
+    surface1: Rgb,
+    text: Rgb,
+    subtext: Rgb,
+    overlay: Rgb,
+    green: Rgb,
+    blue: Rgb,
+    yellow: Rgb,
+    mauve: Rgb,
+    peach: Rgb,
+    red: Rgb,
+    search_bg: Rgb,
+};
+
+const themes = [_]Theme{
+    .{
+        .name = "dark",
+        .surface0 = .{ .r = 49, .g = 50, .b = 68 },
+        .surface1 = .{ .r = 69, .g = 71, .b = 90 },
+        .text = .{ .r = 205, .g = 214, .b = 244 },
+        .subtext = .{ .r = 166, .g = 173, .b = 200 },
+        .overlay = .{ .r = 108, .g = 112, .b = 134 },
+        .green = .{ .r = 166, .g = 227, .b = 161 },
+        .blue = .{ .r = 137, .g = 180, .b = 250 },
+        .yellow = .{ .r = 249, .g = 226, .b = 175 },
+        .mauve = .{ .r = 203, .g = 166, .b = 247 },
+        .peach = .{ .r = 250, .g = 179, .b = 135 },
+        .red = .{ .r = 243, .g = 139, .b = 168 },
+        .search_bg = .{ .r = 62, .g = 56, .b = 30 },
+    },
+    .{
+        .name = "light",
+        .surface0 = .{ .r = 230, .g = 233, .b = 239 },
+        .surface1 = .{ .r = 204, .g = 208, .b = 218 },
+        .text = .{ .r = 76, .g = 79, .b = 105 },
+        .subtext = .{ .r = 108, .g = 111, .b = 133 },
+        .overlay = .{ .r = 156, .g = 160, .b = 176 },
+        .green = .{ .r = 64, .g = 160, .b = 43 },
+        .blue = .{ .r = 30, .g = 102, .b = 245 },
+        .yellow = .{ .r = 223, .g = 142, .b = 29 },
+        .mauve = .{ .r = 136, .g = 57, .b = 239 },
+        .peach = .{ .r = 254, .g = 100, .b = 11 },
+        .red = .{ .r = 210, .g = 15, .b = 57 },
+        .search_bg = .{ .r = 252, .g = 234, .b = 187 },
+    },
+};
+
+var initial_theme_idx: u8 = 0;
+
 // Module-level so async_task capture functions can access it.
 var capture_handle: ?capture.CaptureHandle = null;
 
@@ -48,6 +99,7 @@ const Model = struct {
     rows: u16 = 24,
     cols: u16 = 80,
     start_time: i64 = 0,
+    theme_idx: u8 = 0,
     filter: filter_mod.Filter = .{},
     filter_buf: [128]u8 = .{0} ** 128,
     filter_len: u8 = 0,
@@ -81,6 +133,10 @@ const Model = struct {
     status_buf: [64]u8 = .{0} ** 64,
     status_len: u8 = 0,
     status_time: i64 = 0,
+
+    fn th(self: *const Model) Theme {
+        return themes[self.theme_idx % themes.len];
+    }
 };
 
 const version = "0.1.0";
@@ -88,7 +144,7 @@ const max_packets = 50000;
 const max_bw_samples = 300; // 5 minutes of per-second data
 
 fn init(_: std.mem.Allocator) anyerror!Model {
-    return .{ .start_time = std.time.milliTimestamp() };
+    return .{ .start_time = std.time.milliTimestamp(), .theme_idx = initial_theme_idx };
 }
 
 fn deinit(model: *Model, _: std.mem.Allocator) void {
@@ -218,6 +274,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             if (c == 'n') searchNext(model, true);
             if (c == 'N') searchNext(model, false);
             if (c == 'F') model.follow = !model.follow;
+            if (c == 'T') model.theme_idx = @intCast((model.theme_idx + 1) % themes.len);
         },
         .arrow_up => {
             if (model.hex_view or model.stream_view) {
@@ -552,48 +609,26 @@ fn adjustScroll(model: *Model) void {
     }
 }
 
-const surface0: Rgb = .{ .r = 49, .g = 50, .b = 68 };
-const surface1: Rgb = .{ .r = 69, .g = 71, .b = 90 };
-const text_col: Rgb = .{ .r = 205, .g = 214, .b = 244 };
-const subtext0: Rgb = .{ .r = 166, .g = 173, .b = 200 };
-const overlay0: Rgb = .{ .r = 108, .g = 112, .b = 134 };
-const c_green: Rgb = .{ .r = 166, .g = 227, .b = 161 };
-const c_blue: Rgb = .{ .r = 137, .g = 180, .b = 250 };
-const c_yellow: Rgb = .{ .r = 249, .g = 226, .b = 175 };
-const c_mauve: Rgb = .{ .r = 203, .g = 166, .b = 247 };
-const c_peach: Rgb = .{ .r = 250, .g = 179, .b = 135 };
-const c_red: Rgb = .{ .r = 243, .g = 139, .b = 168 };
-const search_bg: Rgb = .{ .r = 62, .g = 56, .b = 30 }; // dark warm tint for search matches
-
-const title_style: Style = .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col }, .bold = true };
-const header_style: Style = .{ .fg = .{ .rgb = subtext0 }, .bold = true };
-const sep_style: Style = .{ .fg = .{ .rgb = overlay0 } };
-const normal_style: Style = .{ .fg = .{ .rgb = text_col } };
-const selected_style: Style = .{ .bg = .{ .rgb = surface1 }, .fg = .{ .rgb = text_col } };
-const help_style: Style = .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = subtext0 } };
-const help_key_style: Style = .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true };
-const detail_label_style: Style = .{ .fg = .{ .rgb = subtext0 } };
-const detail_value_style: Style = .{ .fg = .{ .rgb = text_col }, .bold = true };
-
-fn protoStyle(proto: packet.Protocol) Style {
-    const fg: Rgb = switch (proto) {
-        .tcp => c_green,
-        .udp => c_blue,
-        .icmp, .icmp6 => c_yellow,
-        .arp => c_mauve,
-        .other => subtext0,
+fn protoColor(t: Theme, proto: packet.Protocol) Rgb {
+    return switch (proto) {
+        .tcp => t.green,
+        .udp => t.blue,
+        .icmp, .icmp6 => t.yellow,
+        .arp => t.mauve,
+        .other => t.subtext,
     };
-    return .{ .fg = .{ .rgb = fg } };
 }
 
 fn view(model: *Model, r: *P.Renderer) void {
     const rows = r.rows;
     const cols = r.cols;
+    const t = model.th();
     if (rows < 10 or cols < 40) {
-        r.writeStyledText(0, 0, "Terminal too small", .{ .fg = .{ .rgb = c_red } });
+        r.writeStyledText(0, 0, "Terminal too small", .{ .fg = .{ .rgb = t.red } });
         return;
     }
 
+    const title_style: Style = .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.text }, .bold = true };
     r.fillRect(0, 0, 1, cols, .{ .char = ' ', .style = title_style });
     r.writeStyledText(0, 1, "sniff", title_style);
     {
@@ -602,32 +637,31 @@ fn view(model: *Model, r: *P.Renderer) void {
         const s = std.fmt.bufPrint(&buf, " [{s}] {d} packets", .{ iface, model.packets.items.len }) catch "";
         r.writeStyledText(0, 7, s, title_style);
     }
-    // Status disappears after 3 seconds
     const now = std.time.milliTimestamp();
     if (model.status_len > 0 and now - model.status_time < 3000) {
         const smsg = model.status_buf[0..model.status_len];
-        r.writeStyledText(0, cols -| @as(u16, @intCast(smsg.len + 2)), " ", .{ .bg = .{ .rgb = surface0 } });
-        r.writeStyledText(0, cols -| @as(u16, @intCast(smsg.len + 1)), smsg, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
-        r.writeStyledText(0, cols -| 1, " ", .{ .bg = .{ .rgb = surface0 } });
+        r.writeStyledText(0, cols -| @as(u16, @intCast(smsg.len + 2)), " ", .{ .bg = .{ .rgb = t.surface0 } });
+        r.writeStyledText(0, cols -| @as(u16, @intCast(smsg.len + 1)), smsg, .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.green }, .bold = true });
+        r.writeStyledText(0, cols -| 1, " ", .{ .bg = .{ .rgb = t.surface0 } });
     } else if (model.paused) {
-        r.writeStyledText(0, cols -| 10, " PAUSED ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true });
+        r.writeStyledText(0, cols -| 10, " PAUSED ", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.red }, .bold = true });
     } else if (model.follow) {
-        r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true });
+        r.writeStyledText(0, cols -| 10, " FOLLOW ", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.green }, .bold = true });
     }
     {
         var info_col: u16 = cols / 3;
         if (model.filter.active) {
-            r.writeStyledText(0, info_col, "filter:", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+            r.writeStyledText(0, info_col, "filter:", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.overlay } });
             info_col += 7;
             const expr = model.filter_buf[0..model.filter_len];
-            r.writeStyledText(0, info_col, expr, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_peach }, .bold = true });
+            r.writeStyledText(0, info_col, expr, .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.peach }, .bold = true });
             info_col += @as(u16, @intCast(expr.len)) + 2;
         }
         if (model.search_active) {
-            r.writeStyledText(0, info_col, "/", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+            r.writeStyledText(0, info_col, "/", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.overlay } });
             info_col += 1;
             const term = model.search_buf[0..model.search_len];
-            r.writeStyledText(0, info_col, term, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true });
+            r.writeStyledText(0, info_col, term, .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.yellow }, .bold = true });
         }
     }
 
@@ -643,6 +677,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         viewPacketList(model, r, rows, cols);
     }
 
+    const help_style: Style = .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.subtext } };
     const help_row: u16 = rows - 1;
     r.fillRect(help_row, 0, 1, cols, .{ .char = ' ', .style = help_style });
     if (model.input_mode != .none) {
@@ -653,40 +688,49 @@ fn view(model: *Model, r: *P.Renderer) void {
             .none => "",
         };
         const prompt_style: Style = if (model.input_error)
-            .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_red }, .bold = true }
+            .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.red }, .bold = true }
         else switch (model.input_mode) {
-            .search => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_yellow }, .bold = true },
-            .save => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_green }, .bold = true },
-            else => .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = c_mauve }, .bold = true },
+            .search => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.yellow }, .bold = true },
+            .save => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.green }, .bold = true },
+            else => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.mauve }, .bold = true },
         };
         r.writeStyledText(help_row, 1, prompt, prompt_style);
         const plen: u16 = @intCast(prompt.len);
         const text = model.input_buf[0..model.input_len];
-        r.writeStyledText(help_row, 1 + plen, text, .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = text_col } });
+        r.writeStyledText(help_row, 1 + plen, text, .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.text } });
         const ccol: u16 = 1 + plen + @as(u16, model.input_cursor);
         const cch: u21 = if (model.input_cursor < model.input_len) model.input_buf[model.input_cursor] else ' ';
-        r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = text_col }, .fg = .{ .rgb = surface0 } });
-        r.writeStyledText(help_row, cols -| 22, "enter:apply esc:cancel", .{ .bg = .{ .rgb = surface0 }, .fg = .{ .rgb = overlay0 } });
+        r.applyCell(help_row, ccol, cch, .{ .bg = .{ .rgb = t.text }, .fg = .{ .rgb = t.surface0 } });
+        r.writeStyledText(help_row, cols -| 22, "enter:apply esc:cancel", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.overlay } });
     } else {
+        const hk_style: Style = .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.mauve }, .bold = true };
         var col: u16 = 1;
-        col = writeHelpKey(r, help_row, col, "q", "quit");
-        col = writeHelpKey(r, help_row, col, "p", "pause");
-        col = writeHelpKey(r, help_row, col, "f", "filter");
-        col = writeHelpKey(r, help_row, col, "/", "search");
-        col = writeHelpKey(r, help_row, col, "n/N", "next/prev");
-        col = writeHelpKey(r, help_row, col, "x", "hex");
-        col = writeHelpKey(r, help_row, col, "t", "stream");
-        col = writeHelpKey(r, help_row, col, "s", "stats");
-        col = writeHelpKey(r, help_row, col, "b", "graph");
-        col = writeHelpKey(r, help_row, col, "w", "export");
-        col = writeHelpKey(r, help_row, col, "F", "follow");
-        _ = writeHelpKey(r, help_row, col, "up/dn", "navigate");
+        col = writeHelpKey(r, help_row, col, "q", "quit", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "p", "pause", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "f", "filter", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "/", "search", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "n/N", "next/prev", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "x", "hex", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "t", "stream", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "s", "stats", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "b", "graph", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "w", "export", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "T", "theme", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "F", "follow", help_style, hk_style);
+        _ = writeHelpKey(r, help_row, col, "up/dn", "navigate", help_style, hk_style);
     }
 }
 
 fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const t = model.th();
+    const header_style: Style = .{ .fg = .{ .rgb = t.subtext }, .bold = true };
+    const normal_style: Style = .{ .fg = .{ .rgb = t.text } };
+    const sep_style: Style = .{ .fg = .{ .rgb = t.overlay } };
+    const dl_style: Style = .{ .fg = .{ .rgb = t.subtext } };
+    const dv_style: Style = .{ .fg = .{ .rgb = t.text }, .bold = true };
+
     writeColumns(r, 1, cols, "#", "Time", "Source", "Destination", "Proto", "Len", header_style);
-    drawHLine(r, 2, cols);
+    drawHLine(r, 2, cols, sep_style);
 
     const lh = listHeight(rows);
     var i: usize = 0;
@@ -697,9 +741,9 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
 
         if (getVisible(model, pkt_idx)) |pkt| {
             const is_match = searchMatches(model, &pkt);
-            const row_bg: Rgb = if (is_selected) surface1 else if (is_match) search_bg else surface0;
+            const row_bg: Rgb = if (is_selected) t.surface1 else if (is_match) t.search_bg else t.surface0;
             const row_style: Style = if (is_selected or is_match)
-                .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = text_col } }
+                .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = t.text } }
             else
                 normal_style;
             if (is_selected or is_match) {
@@ -718,8 +762,8 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             writeColumns(r, row, cols, num_s, time_s, pkt.srcAddr(), pkt.dstAddr(), pkt.protocol.name(), len_s, row_style);
 
             const pcol = protoCol(cols);
-            const ps = protoStyle(pkt.protocol);
-            const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = ps.fg, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = ps.fg } else .{ .fg = ps.fg };
+            const pfg = protoColor(t, pkt.protocol);
+            const pstyle: Style = if (is_selected) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg }, .bold = true } else if (is_match) .{ .bg = .{ .rgb = row_bg }, .fg = .{ .rgb = pfg } } else .{ .fg = .{ .rgb = pfg } };
             r.writeStyledText(row, pcol, pkt.protocol.name(), pstyle);
         } else {
             break;
@@ -727,58 +771,58 @@ fn viewPacketList(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     }
 
     const sep_row: u16 = @intCast(@as(usize, rows) -| 4);
-    drawHLine(r, sep_row, cols);
+    drawHLine(r, sep_row, cols, sep_style);
 
     if (getVisible(model, model.selected)) |pkt| {
         const d1: u16 = sep_row + 1;
         const d2: u16 = sep_row + 2;
 
-        r.writeStyledText(d1, 1, "Src: ", detail_label_style);
-        r.writeStyledText(d1, 6, pkt.srcAddr(), detail_value_style);
+        r.writeStyledText(d1, 1, "Src: ", dl_style);
+        r.writeStyledText(d1, 6, pkt.srcAddr(), dv_style);
         if (pkt.src_port > 0) {
             var pbuf: [8]u8 = undefined;
             const ps = std.fmt.bufPrint(&pbuf, ":{d}", .{pkt.src_port}) catch "";
-            r.writeStyledText(d1, @intCast(6 + pkt.srcAddr().len), ps, detail_value_style);
+            r.writeStyledText(d1, @intCast(6 + pkt.srcAddr().len), ps, dv_style);
         }
 
         const arrow_col: u16 = @intCast(@min(@as(usize, 30), @as(usize, cols) -| 1));
-        r.writeStyledText(d1, arrow_col, " -> ", detail_label_style);
+        r.writeStyledText(d1, arrow_col, " -> ", dl_style);
         const dst_col: u16 = arrow_col + 4;
-        r.writeStyledText(d1, dst_col, "Dst: ", detail_label_style);
-        r.writeStyledText(d1, dst_col + 5, pkt.dstAddr(), detail_value_style);
+        r.writeStyledText(d1, dst_col, "Dst: ", dl_style);
+        r.writeStyledText(d1, dst_col + 5, pkt.dstAddr(), dv_style);
         if (pkt.dst_port > 0) {
             var pbuf2: [8]u8 = undefined;
             const ps2 = std.fmt.bufPrint(&pbuf2, ":{d}", .{pkt.dst_port}) catch "";
-            r.writeStyledText(d1, @intCast(dst_col + 5 + pkt.dstAddr().len), ps2, detail_value_style);
+            r.writeStyledText(d1, @intCast(dst_col + 5 + pkt.dstAddr().len), ps2, dv_style);
         }
 
-        r.writeStyledText(d2, 1, "Proto: ", detail_label_style);
-        r.writeStyledText(d2, 8, pkt.protocol.name(), protoStyle(pkt.protocol));
+        r.writeStyledText(d2, 1, "Proto: ", dl_style);
+        r.writeStyledText(d2, 8, pkt.protocol.name(), .{ .fg = .{ .rgb = protoColor(t, pkt.protocol) } });
         {
             var lbuf: [32]u8 = undefined;
             const ls = std.fmt.bufPrint(&lbuf, "  Len: {d}", .{pkt.length}) catch "";
-            r.writeStyledText(d2, @intCast(8 + pkt.protocol.name().len), ls, detail_label_style);
+            r.writeStyledText(d2, @intCast(8 + pkt.protocol.name().len), ls, dl_style);
         }
         if (pkt.ip_ttl > 0) {
             var tbuf: [16]u8 = undefined;
             const ts = std.fmt.bufPrint(&tbuf, "  TTL: {d}", .{pkt.ip_ttl}) catch "";
-            r.writeStyledText(d2, 28, ts, detail_label_style);
+            r.writeStyledText(d2, 28, ts, dl_style);
         }
         if (pkt.protocol == .tcp and pkt.tcp_flags > 0) {
             var fbuf: [40]u8 = undefined;
             const flags = pkt.tcpFlagsStr(&fbuf);
-            r.writeStyledText(d2, 42, "Flags: ", detail_label_style);
-            r.writeStyledText(d2, 49, flags, .{ .fg = .{ .rgb = c_peach } });
+            r.writeStyledText(d2, 42, "Flags: ", dl_style);
+            r.writeStyledText(d2, 49, flags, .{ .fg = .{ .rgb = t.peach } });
         }
         if (pkt.dns_name_len > 0) {
             const label = if (pkt.dns_is_response) "DNS resp: " else "DNS: ";
-            r.writeStyledText(d2, 42, label, detail_label_style);
-            r.writeStyledText(d2, 42 + @as(u16, @intCast(label.len)), pkt.dnsName(), .{ .fg = .{ .rgb = c_yellow }, .bold = true });
+            r.writeStyledText(d2, 42, label, dl_style);
+            r.writeStyledText(d2, 42 + @as(u16, @intCast(label.len)), pkt.dnsName(), .{ .fg = .{ .rgb = t.yellow }, .bold = true });
         } else if (pkt.tls_sni_len > 0) {
-            r.writeStyledText(d2, 42, "SNI: ", detail_label_style);
-            r.writeStyledText(d2, 47, pkt.sniName(), .{ .fg = .{ .rgb = c_mauve }, .bold = true });
+            r.writeStyledText(d2, 42, "SNI: ", dl_style);
+            r.writeStyledText(d2, 47, pkt.sniName(), .{ .fg = .{ .rgb = t.mauve }, .bold = true });
         } else if (pkt.http_info_len > 0) {
-            r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = c_peach }, .bold = true });
+            r.writeStyledText(d2, 42, pkt.httpInfo(), .{ .fg = .{ .rgb = t.peach }, .bold = true });
         }
     }
 }
@@ -812,6 +856,9 @@ fn updateBwRing(model: *Model, timestamp_ms: i64, length: u32) void {
 }
 
 fn viewGraph(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const t = model.th();
+    const sep_s: Style = .{ .fg = .{ .rgb = t.overlay } };
+
     // Flush current accumulator so the live second is visible
     const cur_sec = @divFloor(std.time.milliTimestamp(), 1000);
     var head = model.bw_head;
@@ -825,12 +872,12 @@ fn viewGraph(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
 
     const sample_count = @min(head, max_bw_samples);
     if (sample_count == 0) {
-        r.writeStyledText(2, 1, "No bandwidth data yet", detail_label_style);
+        r.writeStyledText(2, 1, "No bandwidth data yet", .{ .fg = .{ .rgb = t.subtext } });
         return;
     }
 
-    r.writeStyledText(1, 1, "Live Bandwidth (bytes/sec)", .{ .fg = .{ .rgb = text_col }, .bold = true });
-    drawHLine(r, 2, cols);
+    r.writeStyledText(1, 1, "Live Bandwidth (bytes/sec)", .{ .fg = .{ .rgb = t.text }, .bold = true });
+    drawHLine(r, 2, cols, sep_s);
 
     const graph_w: usize = @as(usize, cols) -| 12;
     const graph_h: usize = @as(usize, rows) -| 8;
@@ -857,10 +904,10 @@ fn viewGraph(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     const bot_row: u16 = @intCast(3 + graph_h);
     {
         var lbuf: [16]u8 = undefined;
-        r.writeStyledText(top_row, 1, fmtBytesRate(max_val, &lbuf), .{ .fg = .{ .rgb = overlay0 } });
-        r.writeStyledText(bot_row, 1, "0", .{ .fg = .{ .rgb = overlay0 } });
+        r.writeStyledText(top_row, 1, fmtBytesRate(max_val, &lbuf), .{ .fg = .{ .rgb = t.overlay } });
+        r.writeStyledText(bot_row, 1, "0", .{ .fg = .{ .rgb = t.overlay } });
         const mid_row = top_row + @as(u16, @intCast(graph_h / 2));
-        r.writeStyledText(mid_row, 1, fmtBytesRate(max_val / 2, &lbuf), .{ .fg = .{ .rgb = overlay0 } });
+        r.writeStyledText(mid_row, 1, fmtBytesRate(max_val / 2, &lbuf), .{ .fg = .{ .rgb = t.overlay } });
     }
 
     // Block characters for sub-cell resolution (eighths)
@@ -887,16 +934,16 @@ fn viewGraph(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         while (gy < graph_h) : (gy += 1) {
             const draw_row: u16 = bot_row - @as(u16, @intCast(gy));
             if (gy < full_rows) {
-                r.applyCell(draw_row, col_x, 0x2588, .{ .fg = .{ .rgb = c_green } });
+                r.applyCell(draw_row, col_x, 0x2588, .{ .fg = .{ .rgb = t.green } });
             } else if (gy == full_rows and frac > 0) {
-                r.applyCell(draw_row, col_x, blocks[frac], .{ .fg = .{ .rgb = c_green } });
+                r.applyCell(draw_row, col_x, blocks[frac], .{ .fg = .{ .rgb = t.green } });
             }
         }
     }
 
     // Summary below the graph
     const info_row: u16 = bot_row + 1;
-    drawHLine(r, info_row, cols);
+    drawHLine(r, info_row, cols, sep_s);
     {
         const avg_bw: u64 = if (show > 0) total_bw / show else 0;
         const avg_pps: u64 = if (show > 0) total_pps / show else 0;
@@ -909,7 +956,7 @@ fn viewGraph(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             avg_pps,
             show,
         }) catch "";
-        r.writeStyledText(info_row + 1, 1, ss, .{ .fg = .{ .rgb = subtext0 } });
+        r.writeStyledText(info_row + 1, 1, ss, .{ .fg = .{ .rgb = t.subtext } });
     }
 }
 
@@ -955,6 +1002,7 @@ fn extractTcpPayload(pkt: *const packet.PacketInfo) ?[]const u8 {
 }
 
 fn viewStream(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const t = model.th();
     const sa = model.stream_src[0..model.stream_src_len];
     const da = model.stream_dst[0..model.stream_dst_len];
 
@@ -963,9 +1011,9 @@ fn viewStream(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         const hs = std.fmt.bufPrint(&hbuf, "TCP Stream: {s}:{d} <-> {s}:{d}", .{
             sa, model.stream_sport, da, model.stream_dport,
         }) catch "";
-        r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = text_col }, .bold = true });
+        r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = t.text }, .bold = true });
     }
-    drawHLine(r, 2, cols);
+    drawHLine(r, 2, cols, .{ .fg = .{ .rgb = t.overlay } });
 
     // Collect output lines from stream packets
     const visible_h = @as(usize, rows) -| 4;
@@ -990,8 +1038,8 @@ fn viewStream(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         // Direction: is this from the "client" (stream_src) side?
         const is_client = std.mem.eql(u8, pkt.srcAddr(), sa) and pkt.src_port == model.stream_sport;
         const arrow: []const u8 = if (is_client) "> " else "< ";
-        const arrow_style: Style = if (is_client) .{ .fg = .{ .rgb = c_green }, .bold = true } else .{ .fg = .{ .rgb = c_blue }, .bold = true };
-        const text_style: Style = if (is_client) .{ .fg = .{ .rgb = c_green } } else .{ .fg = .{ .rgb = c_blue } };
+        const arrow_style: Style = if (is_client) .{ .fg = .{ .rgb = t.green }, .bold = true } else .{ .fg = .{ .rgb = t.blue }, .bold = true };
+        const text_style: Style = if (is_client) .{ .fg = .{ .rgb = t.green } } else .{ .fg = .{ .rgb = t.blue } };
 
         var off: usize = 0;
         while (off < payload.len) {
@@ -1038,18 +1086,19 @@ fn viewStream(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     if (total_lines > visible_h) {
         var sbuf: [32]u8 = undefined;
         const ss = std.fmt.bufPrint(&sbuf, "line {d}/{d}", .{ model.stream_scroll + 1, total_lines }) catch "";
-        r.writeStyledText(rows -| 2, cols -| @as(u16, @intCast(ss.len + 1)), ss, .{ .fg = .{ .rgb = overlay0 } });
+        r.writeStyledText(rows -| 2, cols -| @as(u16, @intCast(ss.len + 1)), ss, .{ .fg = .{ .rgb = t.overlay } });
     }
 
     if (line == 0) {
-        r.writeStyledText(4, 1, "No payload data in this stream", detail_label_style);
+        r.writeStyledText(4, 1, "No payload data in this stream", .{ .fg = .{ .rgb = t.subtext } });
     }
 }
 
 fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const t = model.th();
     const pkts = model.packets.items;
     if (pkts.len == 0) {
-        r.writeStyledText(2, 1, "No packets captured yet", detail_label_style);
+        r.writeStyledText(2, 1, "No packets captured yet", .{ .fg = .{ .rgb = t.subtext } });
         return;
     }
 
@@ -1057,7 +1106,7 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     var proto_bytes: [6]u64 = .{0} ** 6;
     var proto_count: [6]u32 = .{0} ** 6;
     const proto_names = [_][]const u8{ "TCP", "UDP", "ICMP", "ICMPv6", "ARP", "OTHER" };
-    const proto_colors = [_]Rgb{ c_green, c_blue, c_yellow, c_yellow, c_mauve, subtext0 };
+    const proto_colors = [_]Rgb{ t.green, t.blue, t.yellow, t.yellow, t.mauve, t.subtext };
 
     // Top IPs by bytes
     const max_top = 10;
@@ -1087,9 +1136,9 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     }
 
     var row: u16 = 1;
-    r.writeStyledText(row, 1, "Protocol Breakdown", .{ .fg = .{ .rgb = text_col }, .bold = true });
+    r.writeStyledText(row, 1, "Protocol Breakdown", .{ .fg = .{ .rgb = t.text }, .bold = true });
     row += 1;
-    drawHLine(r, row, cols);
+    drawHLine(r, row, cols, .{ .fg = .{ .rgb = t.overlay } });
     row += 1;
 
     // Bar chart per protocol
@@ -1102,11 +1151,11 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
 
         var cbuf: [16]u8 = undefined;
         const cs = std.fmt.bufPrint(&cbuf, "{d}", .{proto_count[pi]}) catch "";
-        r.writeStyledText(row, 10, cs, .{ .fg = .{ .rgb = subtext0 } });
+        r.writeStyledText(row, 10, cs, .{ .fg = .{ .rgb = t.subtext } });
 
         var bbuf: [16]u8 = undefined;
         const bs = fmtBytes(proto_bytes[pi], &bbuf);
-        r.writeStyledText(row, 20, bs, .{ .fg = .{ .rgb = text_col } });
+        r.writeStyledText(row, 20, bs, .{ .fg = .{ .rgb = t.text } });
 
         // Bar
         const ratio: u16 = if (total_bytes > 0) @intCast(@min(@as(u64, bar_max), proto_bytes[pi] * bar_max / total_bytes)) else 0;
@@ -1120,9 +1169,9 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
 
     row += 1;
     if (row < rows -| 2) {
-        r.writeStyledText(row, 1, "Top Source IPs", .{ .fg = .{ .rgb = text_col }, .bold = true });
+        r.writeStyledText(row, 1, "Top Source IPs", .{ .fg = .{ .rgb = t.text }, .bold = true });
         row += 1;
-        drawHLine(r, row, cols);
+        drawHLine(r, row, cols, .{ .fg = .{ .rgb = t.overlay } });
         row += 1;
 
         // Column positions adapt to terminal width
@@ -1138,21 +1187,21 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
 
             const addr = entry.addr[0..entry.len];
             const show_len = @min(addr.len, @as(usize, addr_w) -| 2);
-            r.writeStyledText(row, addr_col, addr[0..show_len], .{ .fg = .{ .rgb = c_blue }, .bold = true });
+            r.writeStyledText(row, addr_col, addr[0..show_len], .{ .fg = .{ .rgb = t.blue }, .bold = true });
 
             var bbuf2: [16]u8 = undefined;
             const bs2 = fmtBytes(entry.bytes, &bbuf2);
-            r.writeStyledText(row, bytes_col, bs2, .{ .fg = .{ .rgb = text_col } });
+            r.writeStyledText(row, bytes_col, bs2, .{ .fg = .{ .rgb = t.text } });
 
             const pct = if (total_bytes > 0) entry.bytes * 100 / total_bytes else 0;
             var pbuf: [8]u8 = undefined;
             const ps = std.fmt.bufPrint(&pbuf, "{d}%", .{pct}) catch "";
-            r.writeStyledText(row, pct_col, ps, .{ .fg = .{ .rgb = subtext0 } });
+            r.writeStyledText(row, pct_col, ps, .{ .fg = .{ .rgb = t.subtext } });
 
             const ratio: u16 = if (total_bytes > 0) @intCast(@min(@as(u64, bar_max), entry.bytes * bar_max / total_bytes)) else 0;
             var bc: u16 = 0;
             while (bc < ratio) : (bc += 1) {
-                r.applyCell(row, bar_col + bc, 0x2588, .{ .fg = .{ .rgb = c_blue } });
+                r.applyCell(row, bar_col + bc, 0x2588, .{ .fg = .{ .rgb = t.blue } });
             }
 
             row += 1;
@@ -1166,7 +1215,7 @@ fn viewStats(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         var bbuf3: [16]u8 = undefined;
         const total_s = fmtBytes(total_bytes, &bbuf3);
         const ts = std.fmt.bufPrint(&tbuf, "Total: {d} packets  {s}", .{ pkts.len, total_s }) catch "";
-        r.writeStyledText(row, 1, ts, .{ .fg = .{ .rgb = text_col }, .bold = true });
+        r.writeStyledText(row, 1, ts, .{ .fg = .{ .rgb = t.text }, .bold = true });
     }
 }
 
@@ -1222,8 +1271,9 @@ fn fmtBytes(bytes: u64, buf: *[16]u8) []const u8 {
 }
 
 fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
+    const t = model.th();
     const pkt = getVisible(model, model.selected) orelse {
-        r.writeStyledText(2, 1, "No packet selected", detail_label_style);
+        r.writeStyledText(2, 1, "No packet selected", .{ .fg = .{ .rgb = t.subtext } });
         return;
     };
 
@@ -1238,9 +1288,9 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
             pkt.protocol.name(),
             pkt.raw_len,
         }) catch "";
-        r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = text_col }, .bold = true });
+        r.writeStyledText(1, 1, hs, .{ .fg = .{ .rgb = t.text }, .bold = true });
     }
-    drawHLine(r, 2, cols);
+    drawHLine(r, 2, cols, .{ .fg = .{ .rgb = t.overlay } });
 
     const bytes_per_line: usize = 16;
     const raw = pkt.raw[0..pkt.raw_len];
@@ -1255,10 +1305,10 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
         model.hex_scroll = 0;
     }
 
-    const offset_style: Style = .{ .fg = .{ .rgb = overlay0 } };
-    const hex_style: Style = .{ .fg = .{ .rgb = c_blue } };
-    const ascii_style: Style = .{ .fg = .{ .rgb = c_green } };
-    const dot_style: Style = .{ .fg = .{ .rgb = overlay0 } };
+    const offset_style: Style = .{ .fg = .{ .rgb = t.overlay } };
+    const hex_style: Style = .{ .fg = .{ .rgb = t.blue } };
+    const ascii_style: Style = .{ .fg = .{ .rgb = t.green } };
+    const dot_style: Style = .{ .fg = .{ .rgb = t.overlay } };
 
     var line_idx: usize = 0;
     while (line_idx < visible) : (line_idx += 1) {
@@ -1303,11 +1353,11 @@ fn viewHexDump(model: *Model, r: *P.Renderer, rows: u16, cols: u16) void {
     }
 }
 
-fn writeHelpKey(r: *P.Renderer, row: u16, col: u16, key: []const u8, desc: []const u8) u16 {
-    r.writeStyledText(row, col, key, help_key_style);
+fn writeHelpKey(r: *P.Renderer, row: u16, col: u16, key: []const u8, desc: []const u8, hs: Style, hks: Style) u16 {
+    r.writeStyledText(row, col, key, hks);
     const after_key: u16 = col + @as(u16, @intCast(key.len));
-    r.writeStyledText(row, after_key, ":", help_style);
-    r.writeStyledText(row, after_key + 1, desc, help_style);
+    r.writeStyledText(row, after_key, ":", hs);
+    r.writeStyledText(row, after_key + 1, desc, hs);
     return after_key + @as(u16, @intCast(desc.len)) + 3;
 }
 
@@ -1359,12 +1409,11 @@ fn writeField(r: *P.Renderer, row: u16, col: u16, width: u16, text: []const u8, 
     r.writeStyledText(row, col, text[0..max], sty);
 }
 
-fn drawHLine(r: *P.Renderer, row: u16, cols: u16) void {
-    // ASCII dash on Windows (CMD lacks box-drawing glyphs), Unicode line elsewhere
+fn drawHLine(r: *P.Renderer, row: u16, cols: u16, sty: Style) void {
     const ch: u21 = if (builtin.os.tag == .windows) '-' else 0x2500;
     var c: u16 = 0;
     while (c < cols) : (c += 1) {
-        r.applyCell(row, c, ch, sep_style);
+        r.applyCell(row, c, ch, sty);
     }
 }
 
@@ -1432,6 +1481,17 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "update")) {
             return runUpdate();
+        } else if (std.mem.eql(u8, arg, "--theme")) {
+            ai += 1;
+            if (ai < argv.len) {
+                const name = std.mem.span(argv[ai]);
+                for (themes, 0..) |th, idx| {
+                    if (std.mem.eql(u8, th.name, name)) {
+                        initial_theme_idx = @intCast(idx);
+                        break;
+                    }
+                }
+            }
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
             std.debug.print("sniff {s}\n", .{version});
             return;
@@ -1443,10 +1503,11 @@ pub fn main() !void {
                 \\       sniff update
                 \\
                 \\Options:
-                \\  -l, --list       List available network interfaces
-                \\  -i <iface>       Capture on a specific interface
-                \\  -V, --version    Show version
-                \\  -h, --help       Show this help
+                \\  -l, --list         List available network interfaces
+                \\  -i <iface>         Capture on a specific interface
+                \\  --theme <name>     Color theme: dark (default), light
+                \\  -V, --version      Show version
+                \\  -h, --help         Show this help
                 \\
                 \\Commands:
                 \\  update           Download and install the latest release
