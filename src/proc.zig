@@ -1,7 +1,7 @@
-// Linux process attribution via /proc/net and /proc/<pid>/fd.
+// Process attribution via platform-specific APIs.
 //
-// Joins socket inodes from /proc/net/{tcp,tcp6,udp,udp6} with
-// file descriptors in /proc/<pid>/fd to map connections to PIDs.
+// Linux: /proc/net/{tcp,tcp6,udp,udp6} inode-to-PID matching.
+// macOS: libproc proc_pidinfo with PROC_PIDFDSOCKETINFO.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,6 +29,132 @@ pub const ProcResult = struct {
     name: []const u8,
 };
 
+// macOS libproc types and extern declarations
+const darwin = if (builtin.os.tag == .macos) struct {
+    const PROC_PIDLISTFDS: c_int = 1;
+    const PROC_PIDFDSOCKETINFO: c_int = 3;
+    const PROX_FDTYPE_SOCKET: u32 = 2;
+    const IPPROTO_TCP: c_int = 6;
+    const IPPROTO_UDP: c_int = 17;
+    const AF_INET: c_int = 2;
+    const AF_INET6: c_int = 30;
+
+    const ProcFdInfo = extern struct {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    };
+
+    const VInfoStat = extern struct {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [2]i64,
+    };
+
+    const ProcFileInfo = extern struct {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
+    };
+
+    const SockbufInfo = extern struct {
+        sbi_cc: u32,
+        sbi_hiwat: u32,
+        sbi_mbcnt: u32,
+        sbi_mbmax: u32,
+        sbi_lowat: u32,
+        sbi_flags: c_short,
+        sbi_timeo: c_short,
+    };
+
+    const InSockInfo = extern struct {
+        insi_fport: c_int,
+        insi_lport: c_int,
+        insi_gencnt: u64,
+        insi_flags: u32,
+        insi_flow: u32,
+        insi_vflag: u8,
+        insi_ip_ttl: u8,
+        rfu_1: u32,
+        insi_faddr: [16]u8,
+        insi_laddr: [16]u8,
+        insi_v4: u8,
+        insi_v6: u8,
+    };
+
+    const TcpSockInfo = extern struct {
+        tcpsi_ini: InSockInfo,
+        tcpsi_state: c_int,
+        tcpsi_timer: [4]c_int,
+        tcpsi_mss: c_int,
+        tcpsi_flags: u32,
+        rfu_1: u32,
+        tcpsi_tp: u64,
+    };
+
+    const SockProto = extern union {
+        pri_in: InSockInfo,
+        pri_tcp: TcpSockInfo,
+    };
+
+    const SocketInfo = extern struct {
+        soi_stat: VInfoStat,
+        soi_so: u64,
+        soi_pcb: u64,
+        soi_type: c_int,
+        soi_protocol: c_int,
+        soi_family: c_int,
+        soi_options: c_short,
+        soi_linger: c_short,
+        soi_state: c_short,
+        soi_qlen: c_int,
+        soi_incqlen: c_int,
+        soi_qlimit: c_int,
+        soi_timeo: c_int,
+        soi_error: c_ushort,
+        soi_oobmark: u32,
+        soi_rcv: SockbufInfo,
+        soi_snd: SockbufInfo,
+        soi_kind: c_int,
+        rfu_1: u32,
+        soi_proto: SockProto,
+    };
+
+    const SocketFdInfo = extern struct {
+        pfi: ProcFileInfo,
+        psi: SocketInfo,
+    };
+
+    extern "c" fn proc_listallpids(buffer: [*]c_int, buffersize: c_int) c_int;
+    extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *anyopaque, buffersize: c_int) c_int;
+    extern "c" fn proc_pidfdinfo(pid: c_int, fd: c_int, flavor: c_int, buffer: *anyopaque, buffersize: c_int) c_int;
+    extern "c" fn proc_name(pid: c_int, buffer: [*]u8, buffersize: u32) c_int;
+
+    /// Convert port from network byte order int to host u16.
+    fn extractPort(raw: c_int) u16 {
+        return std.mem.bigToNative(u16, @truncate(@as(c_uint, @bitCast(raw))));
+    }
+} else struct {};
+
 pub const ProcTable = struct {
     sockets: [max_sockets]SocketEntry = undefined,
     socket_count: usize = 0,
@@ -36,17 +162,20 @@ pub const ProcTable = struct {
     proc_count: usize = 0,
     last_refresh: i64 = 0,
 
-    /// Refresh the proc table by scanning /proc. Call periodically.
+    /// Refresh the proc table. Call periodically.
     pub fn refresh(self: *ProcTable) void {
-        if (comptime builtin.os.tag != .linux) return;
-        self.socket_count = 0;
-        self.proc_count = 0;
-        self.readNetTable("/proc/net/tcp", .tcp);
-        self.readNetTable("/proc/net/tcp6", .tcp);
-        self.readNetTable("/proc/net/udp", .udp);
-        self.readNetTable("/proc/net/udp6", .udp);
-        self.scanProcFds();
-        self.last_refresh = std.time.milliTimestamp();
+        if (comptime builtin.os.tag == .linux) {
+            self.socket_count = 0;
+            self.proc_count = 0;
+            self.readNetTable("/proc/net/tcp", .tcp);
+            self.readNetTable("/proc/net/tcp6", .tcp);
+            self.readNetTable("/proc/net/udp", .udp);
+            self.readNetTable("/proc/net/udp6", .udp);
+            self.scanProcFds();
+            self.last_refresh = std.time.milliTimestamp();
+        } else if (comptime builtin.os.tag == .macos) {
+            self.refreshDarwin();
+        }
     }
 
     /// Look up the owning process for a packet.
@@ -74,6 +203,100 @@ pub const ProcTable = struct {
         }
         return null;
     }
+
+    // -- macOS: libproc scan --
+
+    fn refreshDarwin(self: *ProcTable) void {
+        self.socket_count = 0;
+        self.proc_count = 0;
+
+        var pids: [4096]c_int = undefined;
+        const ret = darwin.proc_listallpids(&pids, @intCast(@sizeOf(@TypeOf(pids))));
+        if (ret <= 0) {
+            self.last_refresh = std.time.milliTimestamp();
+            return;
+        }
+        const pid_count = @as(usize, @intCast(ret)) / @sizeOf(c_int);
+
+        var next_id: u64 = 1;
+        for (pids[0..pid_count]) |pid| {
+            if (pid <= 0) continue;
+            if (self.socket_count >= max_sockets or self.proc_count >= max_procs) break;
+            self.scanDarwinPid(pid, &next_id);
+        }
+
+        self.last_refresh = std.time.milliTimestamp();
+    }
+
+    fn scanDarwinPid(self: *ProcTable, pid: c_int, next_id: *u64) void {
+        var name_buf: [16]u8 = .{0} ** 16;
+        const name_ret = darwin.proc_name(pid, &name_buf, 16);
+        if (name_ret <= 0) return;
+        const name_end = std.mem.indexOfScalar(u8, &name_buf, 0) orelse 16;
+        const name_len: u8 = @intCast(@min(name_end, 15));
+        if (name_len == 0) return;
+
+        var fd_buf: [@sizeOf(darwin.ProcFdInfo) * 512]u8 align(@alignOf(darwin.ProcFdInfo)) = undefined;
+        const fd_ret = darwin.proc_pidinfo(
+            pid,
+            darwin.PROC_PIDLISTFDS,
+            0,
+            @ptrCast(&fd_buf),
+            @intCast(fd_buf.len),
+        );
+        if (fd_ret <= 0) return;
+        const fd_count = @as(usize, @intCast(fd_ret)) / @sizeOf(darwin.ProcFdInfo);
+        const fd_entries: [*]const darwin.ProcFdInfo = @ptrCast(@alignCast(&fd_buf));
+
+        for (fd_entries[0..fd_count]) |fdi| {
+            if (fdi.proc_fdtype != darwin.PROX_FDTYPE_SOCKET) continue;
+            if (self.socket_count >= max_sockets or self.proc_count >= max_procs) return;
+
+            var si_buf: [1024]u8 align(8) = undefined;
+            const si_ret = darwin.proc_pidfdinfo(
+                pid,
+                fdi.proc_fd,
+                darwin.PROC_PIDFDSOCKETINFO,
+                @ptrCast(&si_buf),
+                @intCast(si_buf.len),
+            );
+            if (si_ret <= 0) continue;
+
+            const sfi: *const darwin.SocketFdInfo = @ptrCast(@alignCast(&si_buf));
+            if (sfi.psi.soi_family != darwin.AF_INET and
+                sfi.psi.soi_family != darwin.AF_INET6) continue;
+
+            const proto: packet.Protocol = switch (sfi.psi.soi_protocol) {
+                darwin.IPPROTO_TCP => .tcp,
+                darwin.IPPROTO_UDP => .udp,
+                else => continue,
+            };
+
+            const local_port = darwin.extractPort(sfi.psi.soi_proto.pri_in.insi_lport);
+            const remote_port = darwin.extractPort(sfi.psi.soi_proto.pri_in.insi_fport);
+            if (local_port == 0) continue;
+
+            self.sockets[self.socket_count] = .{
+                .local_port = local_port,
+                .remote_port = remote_port,
+                .proto = proto,
+                .inode = next_id.*,
+            };
+            self.socket_count += 1;
+
+            self.procs[self.proc_count] = .{
+                .inode = next_id.*,
+                .pid = @intCast(pid),
+                .name = name_buf,
+                .name_len = name_len,
+            };
+            self.proc_count += 1;
+
+            next_id.* += 1;
+        }
+    }
+
+    // -- Linux: /proc/net scan --
 
     fn readNetTable(self: *ProcTable, path: []const u8, proto: packet.Protocol) void {
         var path_buf: [32]u8 = undefined;

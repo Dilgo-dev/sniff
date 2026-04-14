@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
         exe_mod.linkSystemLibrary("ws2_32", .{});
     }
 
+    // macOS process attribution via libproc
+    if (target.result.os.tag == .macos) {
+        exe_mod.linkSystemLibrary("proc", .{});
+    }
+
     const exe = b.addExecutable(.{
         .name = "sniff",
         .root_module = exe_mod,

@@ -82,7 +82,7 @@ fn captureOne(_: std.mem.Allocator) anyerror!?App {
     const snap = @min(frame.len, packet.snap_len);
     @memcpy(info.raw[0..snap], frame[0..snap]);
     info.raw_len = @intCast(snap);
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos) {
         const now = info.timestamp_ms;
         if (now - proc_table.last_refresh > 2000) {
             proc_table.refresh();
