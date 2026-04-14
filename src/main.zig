@@ -89,7 +89,7 @@ const App = union(enum) {
 
 const P = glym.Program(Model, App);
 
-const InputMode = enum { none, filter, search, save };
+const InputMode = enum { none, filter, search, fuzzy, save };
 
 const Model = struct {
     packets: std.ArrayList(packet.PacketInfo) = .{},
@@ -108,6 +108,7 @@ const Model = struct {
     search_buf: [128]u8 = .{0} ** 128,
     search_len: u8 = 0,
     search_active: bool = false,
+    search_fuzzy: bool = false,
     hex_view: bool = false,
     hex_scroll: usize = 0,
     stats_view: bool = false,
@@ -311,6 +312,7 @@ fn handleKey(model: *Model, k: glym.input.Key) P.Cmd {
             }
             if (c == 'f') openInput(model, .filter);
             if (c == '/') openInput(model, .search);
+            if (c == '?') openInput(model, .fuzzy);
             if (c == 'w') openInput(model, .save);
             if (c == 'b') {
                 model.graph_view = !model.graph_view;
@@ -512,7 +514,7 @@ fn openInput(model: *Model, mode: InputMode) void {
             @memcpy(model.input_buf[0..model.filter_len], model.filter_buf[0..model.filter_len]);
             model.input_len = model.filter_len;
         },
-        .search => {
+        .search, .fuzzy => {
             @memcpy(model.input_buf[0..model.search_len], model.search_buf[0..model.search_len]);
             model.input_len = model.search_len;
         },
@@ -537,7 +539,14 @@ fn handleTextInput(model: *Model, k: glym.input.Key) void {
             model.input_mode = .none;
             switch (mode) {
                 .filter => applyFilter(model),
-                .search => applySearch(model),
+                .search => {
+                    model.search_fuzzy = false;
+                    applySearch(model);
+                },
+                .fuzzy => {
+                    model.search_fuzzy = true;
+                    applySearch(model);
+                },
                 .save => applyExport(model),
                 .none => {},
             }
@@ -853,21 +862,22 @@ fn applySearch(model: *Model) void {
 fn searchMatches(model: *const Model, pkt: *const packet.PacketInfo) bool {
     if (!model.search_active) return false;
     const term = model.search_buf[0..model.search_len];
-    if (containsSubstring(pkt.srcAddr(), term)) return true;
-    if (containsSubstring(pkt.dstAddr(), term)) return true;
+    const matchFn: *const fn ([]const u8, []const u8) bool = if (model.search_fuzzy) &fuzzyMatch else &containsSubstring;
+    if (matchFn(pkt.srcAddr(), term)) return true;
+    if (matchFn(pkt.dstAddr(), term)) return true;
     var pbuf: [8]u8 = undefined;
     if (pkt.src_port > 0) {
         const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.src_port}) catch "";
-        if (containsSubstring(ps, term)) return true;
+        if (matchFn(ps, term)) return true;
     }
     if (pkt.dst_port > 0) {
         const ps = std.fmt.bufPrint(&pbuf, "{d}", .{pkt.dst_port}) catch "";
-        if (containsSubstring(ps, term)) return true;
+        if (matchFn(ps, term)) return true;
     }
-    if (containsSubstring(pkt.protoLabel(), term)) return true;
-    if (pkt.dns_name_len > 0 and containsSubstring(pkt.dnsName(), term)) return true;
-    if (pkt.tls_sni_len > 0 and containsSubstring(pkt.sniName(), term)) return true;
-    if (pkt.http_info_len > 0 and containsSubstring(pkt.httpInfo(), term)) return true;
+    if (matchFn(pkt.protoLabel(), term)) return true;
+    if (pkt.dns_name_len > 0 and matchFn(pkt.dnsName(), term)) return true;
+    if (pkt.tls_sni_len > 0 and matchFn(pkt.sniName(), term)) return true;
+    if (pkt.http_info_len > 0 and matchFn(pkt.httpInfo(), term)) return true;
     return false;
 }
 
@@ -876,6 +886,18 @@ fn containsSubstring(haystack: []const u8, needle: []const u8) bool {
     var i: usize = 0;
     while (i + needle.len <= haystack.len) : (i += 1) {
         if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return false;
+    var ni: usize = 0;
+    for (haystack) |hc| {
+        if (std.ascii.toLower(hc) == std.ascii.toLower(needle[ni])) {
+            ni += 1;
+            if (ni == needle.len) return true;
+        }
     }
     return false;
 }
@@ -996,7 +1018,8 @@ fn view(model: *Model, r: *P.Renderer) void {
             info_col += @as(u16, @intCast(expr.len)) + 2;
         }
         if (model.search_active) {
-            r.writeStyledText(0, info_col, "/", .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.overlay } });
+            const prefix: []const u8 = if (model.search_fuzzy) "~" else "/";
+            r.writeStyledText(0, info_col, prefix, .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.overlay } });
             info_col += 1;
             const term = model.search_buf[0..model.search_len];
             r.writeStyledText(0, info_col, term, .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.yellow }, .bold = true });
@@ -1026,13 +1049,14 @@ fn view(model: *Model, r: *P.Renderer) void {
         const prompt: []const u8 = switch (model.input_mode) {
             .filter => "filter: ",
             .search => "search: ",
+            .fuzzy => "fuzzy: ",
             .save => "export: ",
             .none => "",
         };
         const prompt_style: Style = if (model.input_error)
             .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.red }, .bold = true }
         else switch (model.input_mode) {
-            .search => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.yellow }, .bold = true },
+            .search, .fuzzy => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.yellow }, .bold = true },
             .save => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.green }, .bold = true },
             else => .{ .bg = .{ .rgb = t.surface0 }, .fg = .{ .rgb = t.mauve }, .bold = true },
         };
@@ -1059,6 +1083,7 @@ fn view(model: *Model, r: *P.Renderer) void {
         col = writeHelpKey(r, help_row, col, "p", "pause", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "f", "filter", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "/", "search", help_style, hk_style);
+        col = writeHelpKey(r, help_row, col, "?", "fuzzy", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "n/N", "next/prev", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "x", "hex", help_style, hk_style);
         col = writeHelpKey(r, help_row, col, "t", "stream", help_style, hk_style);
